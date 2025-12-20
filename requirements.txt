@@ -29,5 +29,4 @@ black
 flake8
 isort
 
-# Local package installation
--e .
+# https://hf-mirror.com

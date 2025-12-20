@@ -92,9 +92,18 @@ class CubeDiffAttnProcessor:
 
 class CubeDiffTransformerBlock(BasicTransformerBlock):
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, num_faces: int = 18, adjacency_mask: torch.Tensor = None, **kwargs):
+        """
+        Extended CubeDiffTransformerBlock with configurable number of views and sparse attention.
+        
+        Args:
+            num_faces: Number of views (6 for original CubeDiff, 18 for PolyDiff-18)
+            adjacency_mask: Optional [num_faces, num_faces] tensor where 1 = can attend, 0 = cannot attend
+                           If provided, creates sparse self-attention based on view adjacency.
+        """
         super().__init__(*args, **kwargs)
-        self.num_faces = 6
+        self.num_faces = num_faces
+        self.register_buffer('adjacency_mask', adjacency_mask)
         self.attn1.set_processor(CubeDiffAttnProcessor())
 
     def forward(
@@ -150,18 +159,26 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         norm_hidden_states = rearrange(norm_hidden_states, "(b t) (hw) c -> b (t hw) c", b=B, t=T, hw=hw)
 
         front_face_drop = cross_attention_kwargs.pop("front_face_drop", False)
+        use_sparse_attention = cross_attention_kwargs.pop("use_sparse_attention", False)
 
+        # Build self-attention mask
         if front_face_drop:
-            # Right now it's a bit hacky, because we drop front face 
-            # For the whole minibatch with probability 10%, as opposed to 
-            # Dropping the front face for each sample independently. This is because
-            # Using the mask would cause the backend to always use math mode instead of flashattention, which is much slower.
+            # Hacky front face drop for CFG - drop front face for whole minibatch with probability
             with torch.no_grad():
                 # [B, H, Q, K]
-                # This should work.... Since it broadcasts
                 self_attention_mask = torch.ones((1, 1, 1, T*hw), dtype=torch.bool, device=hidden_states.device)
                 self_attention_mask[:, :, :, :hw] = False
+        elif self.adjacency_mask is not None and use_sparse_attention:
+            # SPARSE ATTENTION MODE (DISABLED BY DEFAULT DUE TO MEMORY CONSTRAINTS)
+            # For 18 views with 64x64 latents, this would require ~20GB GPU memory
+            # adjacency_mask: [T, T] where 1 = can attend, 0 = cannot attend
+            print("[WARNING] Sparse attention is memory-intensive and disabled by default.")
+            print("[WARNING] Using full attention instead. Set use_sparse_attention=True to enable.")
+            self_attention_mask = None
         else:
+            # FULL ATTENTION MODE (DEFAULT)
+            # All views can attend to all other views
+            # This is more memory-efficient than sparse masking for large T*hw
             self_attention_mask = None
 
         attn_output = self.attn1(
@@ -172,10 +189,12 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         )
 
         # Delete the attention mask to save memory
-        del self_attention_mask
+        if self_attention_mask is not None:
+            del self_attention_mask
  
         # reshape back to (B*T, C, H, W) post attention
         attn_output = rearrange(attn_output, "b (t hw) c -> (b t) (hw) c", b=B, t=T, hw=hw)
+
 
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output

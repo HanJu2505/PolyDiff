@@ -14,10 +14,21 @@ def freeze(module: nn.Module) -> None:
     for p in module.parameters():
         p.requires_grad = False
 
-def swap_transformer_blocks(root: nn.Module) -> None:
-    """Replace every `BasicTransformerBlock` inside `Transformer2DModel`."""
+def swap_transformer_blocks(root: nn.Module, num_faces: int = 18, adjacency_mask: torch.Tensor = None) -> None:
+    """Replace every `BasicTransformerBlock` inside `Transformer2DModel`.
+    
+    Args:
+        root: The root module to search for transformer blocks
+        num_faces: Number of views (6 for CubeDiff, 18 for PolyDiff-18)
+        adjacency_mask: Optional [num_faces, num_faces] adjacency matrix for sparse attention
+    """
+    # Build default adjacency mask for 18 views if not provided
+    if adjacency_mask is None and num_faces == 18:
+        from .geometry import build_adjacency_mask_18
+        adjacency_mask = build_adjacency_mask_18(threshold_deg=90.0)
+    
     for child in root.children():
-        swap_transformer_blocks(child)
+        swap_transformer_blocks(child, num_faces=num_faces, adjacency_mask=adjacency_mask)
         if isinstance(child, Transformer2DModel):
             for i, blk in enumerate(child.transformer_blocks):
                 if isinstance(blk, BasicTransformerBlock):
@@ -37,6 +48,8 @@ def swap_transformer_blocks(root: nn.Module) -> None:
                         norm_eps=getattr(child.config, 'norm_eps', 1e-5),
                         upcast_attention=getattr(child.config, 'upcast_attention', False),
                         attention_type=getattr(child.config, 'attention_type', 'default'),
+                        num_faces=num_faces,
+                        adjacency_mask=adjacency_mask,
                     )
                     # Load the state dict with proper error handling
                     try:
@@ -92,7 +105,7 @@ def patch_unet(unet: UNet2DConditionModel, in_channels: int = 7) -> UNet2DCondit
     return unet
 
 
-def patch_groupnorm(root: nn.Module, num_faces: int = 6) -> None:
+def patch_groupnorm(root: nn.Module, num_faces: int = 18) -> None:
     """Recursively replace GroupNorm with CubeDiffGroupNorm (in-place)."""
     for name, child in list(root.named_children()):
         patch_groupnorm(child, num_faces=num_faces)

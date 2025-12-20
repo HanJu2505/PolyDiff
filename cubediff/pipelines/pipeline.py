@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import List, Optional, Union
 import torch
 import numpy as np
+from tqdm.auto import tqdm
 
 from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_output import BaseOutput
@@ -99,7 +100,15 @@ class CubeDiffPipeline(StableDiffusionPipeline):
         ref_lat = self.vae.encode(conditioning_image).latent_dist.mean[0]
         ref_lat *= self.vae.config.scaling_factor
 
-        for t in self.scheduler.timesteps:
+        # --- Denoising loop with progress bar ---
+        progress_bar = tqdm(
+            self.scheduler.timesteps,
+            desc="Generating 360° panorama",
+            total=len(self.scheduler.timesteps),
+            unit="step"
+        )
+        
+        for i, t in enumerate(progress_bar):
             latents[0] = ref_lat  # keep front face fixed
             latents_scaled = self.scheduler.scale_model_input(latents, t)
             latents_input = torch.cat([latents_scaled, static_extra], dim=1)
@@ -113,7 +122,13 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             ).sample
 
             combined = noise_pred_uncond + cfg_scale * (noise_pred - noise_pred_uncond)
-            latents[1:] = self.scheduler.step(combined[1:], t, latents[1:]).prev_sample  
+            latents[1:] = self.scheduler.step(combined[1:], t, latents[1:]).prev_sample
+            
+            # Update progress bar with current step info
+            progress_bar.set_postfix({
+                'timestep': f'{t.item():.0f}',
+                'step': f'{i+1}/{len(self.scheduler.timesteps)}'
+            })
 
         # --- decode ---------------------------------------------------------
         imgs = self.vae.decode(latents / self.vae.config.scaling_factor).sample

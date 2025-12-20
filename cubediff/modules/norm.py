@@ -2,7 +2,7 @@ import torch.nn as nn
 from einops import rearrange
 
 class CubeDiffGroupNorm(nn.Module):
-    def __init__(self, original_norm: nn.GroupNorm, num_faces: int = 6, sync_enabled: bool = True):
+    def __init__(self, original_norm: nn.GroupNorm, num_faces: int = 18, sync_enabled: bool = True):
         super().__init__()
         self.num_faces = num_faces
         self.sync_enabled = sync_enabled
