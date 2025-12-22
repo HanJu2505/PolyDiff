@@ -19,13 +19,13 @@ from typing import Dict, Tuple, List
 # Group D (Bottom-Polar Seams - 4): Cover bottom-side seams
 
 VIEW_CONFIG_18: Dict[int, Tuple[str, float, float]] = {
-    # Group A: Main Views (Standard Cubemap)
-    0: ("front", 0.0, 0.0),       # Anchor view
-    1: ("right", 90.0, 0.0),
-    2: ("back", 180.0, 0.0),
-    3: ("left", 270.0, 0.0),
-    4: ("top", 0.0, 90.0),
-    5: ("bottom", 0.0, -90.0),
+    # Group A: Main Views (Matching CubeDiff order: front, back, left, right, top, bottom)
+    0: ("front", 0.0, 0.0),       # Anchor view - looking at +Z
+    1: ("back", 180.0, 0.0),      # Looking at -Z
+    2: ("left", 270.0, 0.0),      # Looking at -X
+    3: ("right", 90.0, 0.0),      # Looking at +X
+    4: ("top", 0.0, 90.0),        # Looking at +Y (up/sky)
+    5: ("bottom", 0.0, -90.0),    # Looking at -Y (down/ground)
     # Group B: Equator Seams (yaw 45°, 135°, 225°, 315°; pitch 0°)
     6: ("seam_fr", 45.0, 0.0),    # Front-Right seam
     7: ("seam_rb", 135.0, 0.0),   # Right-Back seam
@@ -219,11 +219,11 @@ def assign_prompts_18(layout: Dict[str, str]) -> List[str]:
     """
     prompts = [""] * 18
     
-    # Main views - use specific descriptions
+    # Main views - use specific descriptions (matching CubeDiff face order)
     prompts[0] = layout.get('Front', layout.get('Overall', ''))
-    prompts[1] = layout.get('Right', layout.get('Overall', ''))
-    prompts[2] = layout.get('Back', layout.get('Overall', ''))
-    prompts[3] = layout.get('Left', layout.get('Overall', ''))
+    prompts[1] = layout.get('Back', layout.get('Overall', ''))
+    prompts[2] = layout.get('Left', layout.get('Overall', ''))
+    prompts[3] = layout.get('Right', layout.get('Overall', ''))
     prompts[4] = layout.get('Top', layout.get('Overall', ''))
     prompts[5] = layout.get('Bottom', layout.get('Overall', ''))
     

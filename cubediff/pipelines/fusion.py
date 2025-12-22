@@ -1,12 +1,14 @@
 """
-PolyDiff-18 Gaussian Weighted Spherical Fusion Module
+PolyDiff-18 Fusion Module
 
-Fuses 18 perspective views into a single Equirectangular Panorama (ERP) image
-using Gaussian-weighted blending to eliminate seams.
+Fuses 18 perspective views into a single Equirectangular Panorama (ERP) image.
+Uses py360convert for perfect cube-to-ERP conversion for main views,
+plus custom blending for seam views.
 """
 
 import numpy as np
 import torch
+import py360convert
 from typing import Dict, List, Tuple, Optional
 import math
 
@@ -46,7 +48,8 @@ def perspective_to_spherical(px: np.ndarray, py: np.ndarray,
     
     # Apply rotation: first yaw (around Y), then pitch (around X)
     yaw_rad = np.radians(yaw_deg)
-    pitch_rad = np.radians(pitch_deg)
+    # NEGATE pitch to match CubeDiff convention: pitch=+90 should look UP (+Y)
+    pitch_rad = np.radians(-pitch_deg)
     
     # Rotation around Y-axis (yaw)
     x_yaw = x * np.cos(yaw_rad) + z * np.sin(yaw_rad)
@@ -395,7 +398,8 @@ def spherical_to_perspective(theta: np.ndarray, phi: np.ndarray,
         valid: Boolean mask for valid projections (in front of camera and within FOV)
     """
     yaw_rad = np.radians(yaw_deg)
-    pitch_rad = np.radians(pitch_deg)
+    # NEGATE pitch to match CubeDiff convention
+    pitch_rad = np.radians(-pitch_deg)
     
     # Convert spherical to 3D unit vector (world space)
     x_world = np.cos(phi) * np.sin(theta)
@@ -561,6 +565,319 @@ def inverse_mapping_fusion(views: List[np.ndarray],
     return erp_image
 
 
+def tiered_fusion(views: List[np.ndarray],
+                  view_config: Dict[int, Tuple[str, float, float]],
+                  fov_deg: float = 95.0,
+                  erp_height: int = 1024,
+                  erp_width: int = 2048,
+                  valid_fov_deg: float = 90.0,
+                  core_fov_deg: float = 80.0,
+                  sigma_factor: float = 0.3) -> np.ndarray:
+    """
+    Tiered fusion: Main views form the backbone, seam views only blend at edges.
+    
+    Key insight from CubeDiff:
+    - Views are GENERATED at 95° FOV for overlap margin
+    - Only the CENTER 90° is actually VALID content
+    - Content beyond 90° should be DISCARDED
+    - Seams happen exactly at the 90° boundary
+    
+    Strategy:
+    - Core region (< core_fov_deg): Use ONLY main view, weight=1.0
+    - Transition region (core_fov_deg ~ valid_fov_deg): Blend main + seam views
+    - Outside valid_fov_deg: DISCARD (don't use this content)
+    
+    Args:
+        views: List of 18 perspective images [H, W, 3]
+        view_config: Dict {idx: (name, yaw, pitch)}
+        fov_deg: Actual generation FOV (95°)
+        erp_height, erp_width: Output ERP dimensions
+        valid_fov_deg: Maximum valid FOV to use (90°) - content beyond is discarded
+        core_fov_deg: FOV for core region where main view dominates (80°)
+        sigma_factor: Gaussian sigma for seam view blending
+    
+    Returns:
+        ERP image [erp_height, erp_width, 3]
+    """
+    if len(views) == 0:
+        raise ValueError("No views provided")
+    
+    img_size = views[0].shape[0]
+    main_view_indices = list(range(6))   # 0-5: main views
+    seam_view_indices = list(range(6, 18))  # 6-17: seam views
+    
+    print(f"[Tiered Fusion] Main views: 6, Seam views: 12")
+    print(f"[Tiered Fusion] Valid FOV: {valid_fov_deg}° (content beyond discarded)")
+    print(f"[Tiered Fusion] Core FOV: {core_fov_deg}° (main view only)")
+    
+    # Create ERP coordinate grid
+    erp_u, erp_v = np.meshgrid(np.arange(erp_width), np.arange(erp_height))
+    theta, phi = erp_to_spherical(erp_u, erp_v, erp_width, erp_height)
+    
+    # Calculate distance thresholds in pixels
+    # The key is that we crop from 95° to 90° - only use center portion
+    f = img_size / (2 * np.tan(np.radians(fov_deg) / 2))  # Focal length for 95°
+    
+    # Maximum valid distance (90° boundary)
+    valid_max_dist = f * np.tan(np.radians(valid_fov_deg / 2))
+    # Core distance (80° - main view dominates)
+    core_max_dist = f * np.tan(np.radians(core_fov_deg / 2))
+    
+    # Initialize accumulators
+    erp_image = np.zeros((erp_height, erp_width, 3), dtype=np.float64)
+    weight_sum = np.zeros((erp_height, erp_width))
+    
+    # =======================================================
+    # STEP 1: Process Main Views (0-5) - They form the backbone
+    # Full coverage at weight=1 for entire valid 90° range
+    # =======================================================
+    print("[Tiered Fusion] Processing main views...")
+    for view_idx in main_view_indices:
+        view_img = views[view_idx].astype(np.float64)
+        name, yaw_deg_v, pitch_deg_v = view_config[view_idx]
+        
+        # Project ERP to this view
+        px, py, valid = spherical_to_perspective(
+            theta, phi, yaw_deg_v, pitch_deg_v, fov_deg, img_size
+        )
+        
+        # Calculate distance from view center
+        center = img_size / 2.0
+        dist = np.sqrt((px - center)**2 + (py - center)**2)
+        
+        # IMPORTANT: Only use content within valid_fov_deg (90°)
+        valid = valid & (dist <= valid_max_dist)
+        
+        # Main views get weight=1 for the ENTIRE valid range (0-90°)
+        # This ensures 100% coverage - no gaps!
+        weight = np.where(valid, 1.0, 0.0)
+        
+        # Sample from view
+        px_int = np.clip(px.astype(np.int32), 0, img_size - 1)
+        py_int = np.clip(py.astype(np.int32), 0, img_size - 1)
+        sampled = view_img[py_int, px_int]
+        
+        erp_image += sampled * weight[..., None]
+        weight_sum += weight
+    
+    # =======================================================
+    # STEP 2: Process Seam Views (6-17) - They smooth the edges
+    # Seam views blend in the 80-90° edge zone for smooth transitions
+    # =======================================================
+    print("[Tiered Fusion] Processing seam views...")
+    for view_idx in seam_view_indices:
+        view_img = views[view_idx].astype(np.float64)
+        name, yaw_deg_v, pitch_deg_v = view_config[view_idx]
+        
+        # Project ERP to this view
+        px, py, valid = spherical_to_perspective(
+            theta, phi, yaw_deg_v, pitch_deg_v, fov_deg, img_size
+        )
+        
+        # Calculate distance from view center
+        center = img_size / 2.0
+        dist = np.sqrt((px - center)**2 + (py - center)**2)
+        
+        # IMPORTANT: Only use content within valid_fov_deg (90°)
+        valid_seam = valid & (dist <= valid_max_dist)
+        
+        # Seam views use Gaussian weight, modulated to blend at edges
+        # They contribute most at the seam lines (where main views meet)
+        sigma = sigma_factor * img_size
+        gaussian_weight = np.exp(-dist**2 / (2 * sigma**2))
+        gaussian_weight = np.where(valid_seam, gaussian_weight, 0)
+        
+        # Scale down seam view contribution to just add smoothing (not overpower main views)
+        # This makes seam views a subtle blend layer
+        seam_weight = gaussian_weight * 0.5  # 50% contribution max
+        
+        # Sample from view
+        px_int = np.clip(px.astype(np.int32), 0, img_size - 1)
+        py_int = np.clip(py.astype(np.int32), 0, img_size - 1)
+        sampled = view_img[py_int, px_int]
+        
+        erp_image += sampled * seam_weight[..., None]
+        weight_sum += seam_weight
+    
+    # =======================================================
+    # STEP 3: Normalize
+    # =======================================================
+    erp_image = erp_image / (weight_sum[..., None] + 1e-8)
+    
+    # Report coverage
+    coverage = np.sum(weight_sum > 0.01) / (erp_height * erp_width) * 100
+    print(f"[Tiered Fusion] Complete. Coverage: {coverage:.1f}%")
+    
+    erp_image = np.clip(erp_image, 0, 255).astype(np.uint8)
+    return erp_image
+
+
+def tiered_fusion_v2(views: List[np.ndarray],
+                     view_config: Dict[int, Tuple[str, float, float]],
+                     fov_deg: float = 95.0,
+                     erp_height: int = 1024,
+                     erp_width: int = 2048,
+                     crop_to_90: bool = True,
+                     blend_seam_views: bool = True,
+                     seam_start_deg: float = 85.0,
+                     seam_end_deg: float = 90.0) -> np.ndarray:
+    """
+    Tiered fusion V2: Uses py360convert for 6 main views (guaranteed 100% coverage),
+    then blends 12 seam views ONLY at the actual seam lines.
+    
+    Key principle:
+    - Main view cores (0° to seam_start_deg): UNTOUCHED, 100% main view
+    - Seam band (seam_start_deg to seam_end_deg): Gradual blend with seam views
+    
+    Args:
+        views: List of 18 perspective images [H, W, 3]
+        view_config: Dict {idx: (name, yaw, pitch)} - must match CubeDiff order
+        fov_deg: Generation FOV (95°)
+        erp_height, erp_width: Output ERP dimensions
+        crop_to_90: If True, crop from 95° to 90° before stitching
+        blend_seam_views: If True, blend seam views at seam lines
+        seam_start_deg: Start of seam blend zone (main view core ends here)
+        seam_end_deg: End of seam blend zone (edge of main view)
+    
+    Returns:
+        ERP image [erp_height, erp_width, 3]
+    """
+    from .postprocessing import crop_image_by_fov
+    
+    if len(views) < 6:
+        raise ValueError("Need at least 6 main views")
+    
+    print(f"[Tiered Fusion V2] Using py360convert for main views...")
+    
+    # Step 1: Prepare 6 main views for py360convert
+    main_views = []
+    for i in range(6):
+        view = views[i]
+        if crop_to_90 and fov_deg > 90:
+            view = crop_image_by_fov(view, fov_deg, 90.0)
+        main_views.append(view)
+    
+    main_views = np.array(main_views)
+    
+    # Step 2: Use py360convert for cube-to-ERP (100% coverage)
+    cube_dict = {
+        "F": main_views[0],  # front
+        "B": main_views[1],  # back
+        "L": main_views[2],  # left
+        "R": main_views[3],  # right
+        "U": main_views[4],  # top
+        "D": main_views[5],  # bottom
+    }
+    
+    erp_image = py360convert.c2e(cube_dict, h=erp_height, w=erp_width, cube_format='dict')
+    
+    if erp_image.dtype != np.uint8:
+        erp_image = np.clip(erp_image, 0, 255).astype(np.uint8)
+    
+    print(f"[Tiered Fusion V2] Main views stitched. Shape: {erp_image.shape}")
+    
+    if not blend_seam_views or len(views) < 18:
+        return erp_image
+    
+    # Step 3: Create seam mask based on CUBE GEOMETRY
+    # The seams are the 12 EDGES of the cube, not circles around face centers
+    print(f"[Tiered Fusion V2] Computing cube edge seam mask (edge width: {seam_end_deg - seam_start_deg}°)...")
+    
+    erp_u, erp_v = np.meshgrid(np.arange(erp_width), np.arange(erp_height))
+    theta, phi = erp_to_spherical(erp_u, erp_v, erp_width, erp_height)
+    
+    # Convert ERP coords to 3D unit vectors
+    x = np.cos(phi) * np.sin(theta)
+    y = np.sin(phi)
+    z = np.cos(phi) * np.cos(theta)
+    
+    # For cube mapping, each face is determined by which axis is dominant
+    # Face assignment: largest absolute component determines the face
+    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
+    max_abs = np.maximum(np.maximum(abs_x, abs_y), abs_z)
+    
+    # Distance to cube edge = difference between max component and second-max component
+    # When this difference is small, we're near a cube edge
+    # Sort the three values to find edge proximity
+    sorted_vals = np.sort(np.stack([abs_x, abs_y, abs_z], axis=-1), axis=-1)
+    # sorted_vals[..., 2] = max, sorted_vals[..., 1] = second, sorted_vals[..., 0] = min
+    
+    # Edge proximity: ratio of second/max (1.0 = exactly on edge, 0.0 = at face center)
+    edge_ratio = sorted_vals[..., 1] / (sorted_vals[..., 2] + 1e-8)
+    
+    # Convert seam degrees to edge ratio
+    # At 45° from face center, edge_ratio ≈ 1.0 (on the edge)
+    # At 0° from face center, edge_ratio = 0 (at center)
+    # seam_start_deg = 85° means edge_ratio ≈ tan(85°)/tan(45°) ≈ 11.4/1 → clamped
+    # Actually, let's use a simpler approach: angular distance to nearest edge
+    # The edge is at 45° from face center (where two faces meet)
+    
+    # Angular distance from face center = atan(second/max) in radians
+    angular_from_edge = np.degrees(np.arctan(edge_ratio))  # 0° = center, 45° = edge
+    
+    # Seam band: when angular_from_edge is within [seam_start_deg - 45, seam_end_deg - 45] of 45°
+    # Remap: at edge, angular_from_edge = 45°
+    # So "near edge" means angular_from_edge > threshold
+    edge_threshold_start = seam_start_deg - 45  # e.g., 85-45 = 40°
+    edge_threshold_end = seam_end_deg - 45      # e.g., 90-45 = 45°
+    
+    # Create seam mask: high when close to edge (angular_from_edge is high)
+    seam_mask = np.zeros((erp_height, erp_width))
+    in_seam_band = (angular_from_edge >= edge_threshold_start) & (angular_from_edge <= edge_threshold_end)
+    blend_factor = (angular_from_edge - edge_threshold_start) / (edge_threshold_end - edge_threshold_start + 1e-8)
+    blend_factor = np.clip(blend_factor, 0, 1)
+    seam_mask = np.where(in_seam_band, blend_factor, seam_mask)
+    
+    seam_pixel_count = np.sum(seam_mask > 0)
+    print(f"[Tiered Fusion V2] Seam pixels: {seam_pixel_count} ({seam_pixel_count / (erp_height * erp_width) * 100:.1f}%)")
+    
+    # Step 4: Blend seam views ONLY where seam_mask > 0
+    print(f"[Tiered Fusion V2] Blending seam views at seam lines...")
+    
+    erp_float = erp_image.astype(np.float64)
+    seam_accumulator = np.zeros((erp_height, erp_width, 3), dtype=np.float64)
+    seam_weight_sum = np.zeros((erp_height, erp_width))
+    
+    img_size = views[0].shape[0]
+    f = img_size / (2 * np.tan(np.radians(fov_deg) / 2))
+    valid_max_dist = f * np.tan(np.radians(90.0 / 2))
+    
+    for view_idx in range(6, 18):
+        view_img = views[view_idx].astype(np.float64)
+        name, yaw_deg_v, pitch_deg_v = view_config[view_idx]
+        
+        px, py, valid = spherical_to_perspective(
+            theta, phi, yaw_deg_v, pitch_deg_v, fov_deg, img_size
+        )
+        
+        center = img_size / 2.0
+        dist = np.sqrt((px - center)**2 + (py - center)**2)
+        valid_seam = valid & (dist <= valid_max_dist)
+        
+        # Seam view weight: high at center, low at edges
+        sigma = 0.35 * img_size
+        weight = np.exp(-dist**2 / (2 * sigma**2))
+        weight = np.where(valid_seam, weight, 0)
+        
+        px_int = np.clip(px.astype(np.int32), 0, img_size - 1)
+        py_int = np.clip(py.astype(np.int32), 0, img_size - 1)
+        sampled = view_img[py_int, px_int]
+        
+        seam_accumulator += sampled * weight[..., None]
+        seam_weight_sum += weight
+    
+    # Compute blended seam content
+    seam_content = seam_accumulator / (seam_weight_sum[..., None] + 1e-8)
+    
+    # Apply seam content ONLY where seam_mask > 0
+    # erp_final = erp_main * (1 - seam_mask) + seam_content * seam_mask
+    erp_final = erp_float * (1 - seam_mask[..., None]) + seam_content * seam_mask[..., None]
+    
+    erp_image = np.clip(erp_final, 0, 255).astype(np.uint8)
+    print(f"[Tiered Fusion V2] Complete. Core untouched, seams blended.")
+    return erp_image
+
+
 if __name__ == "__main__":
     # Simple test with dummy data
     from .geometry import VIEW_CONFIG_18
@@ -570,5 +887,6 @@ if __name__ == "__main__":
     views = [np.zeros((img_size, img_size, 3), dtype=np.uint8) for _ in range(18)]
     
     # Run fusion
-    erp = inverse_mapping_fusion(views, VIEW_CONFIG_18, fov_deg=95.0, mode="wta")
+    erp = tiered_fusion_v2(views, VIEW_CONFIG_18, fov_deg=95.0, blend_seam_views=False)
     print(f"Output ERP shape: {erp.shape}")
+

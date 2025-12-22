@@ -155,6 +155,19 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        # Dynamic T inference
+        # If total batch size is divisible by num_faces (18), assume T=18
+        # If divisible by 6 but not 18, assume T=6 (for stage 1 of two-stage generation)
+        if bt % self.num_faces == 0:
+            T = self.num_faces
+        elif bt % 6 == 0:
+            T = 6
+        else:
+            # Fallback (shouldn't happen in our pipeline)
+            T = self.num_faces
+
+        B = bt // T
+
         # reshape to attend to all faces
         norm_hidden_states = rearrange(norm_hidden_states, "(b t) (hw) c -> b (t hw) c", b=B, t=T, hw=hw)
 
@@ -162,7 +175,9 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         use_sparse_attention = cross_attention_kwargs.pop("use_sparse_attention", False)
 
         # Build self-attention mask
-        if front_face_drop:
+        if front_face_drop and T == self.num_faces:
+            # Only drop front face if we are in full 18-view mode
+            # If in 6-view mode, front face is needed as anchor
             # Hacky front face drop for CFG - drop front face for whole minibatch with probability
             with torch.no_grad():
                 # [B, H, Q, K]

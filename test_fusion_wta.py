@@ -24,7 +24,7 @@ erp_wta = inverse_mapping_fusion(
     views, VIEW_CONFIG_18, 
     fov_deg=95.0,
     mode="wta",
-    effective_fov_deg=90.0  # Increased from 70 to 90
+    effective_fov_deg=95.0  # FULL coverage - no edge clipping
 )
 Image.fromarray(erp_wta).save(f"{output_dir}/erp_wta.png")
 print(f"Saved to {output_dir}/erp_wta.png")
@@ -35,7 +35,7 @@ erp_gaussian = inverse_mapping_fusion(
     views, VIEW_CONFIG_18, 
     fov_deg=95.0,
     mode="gaussian",
-    effective_fov_deg=90.0,  # Increased from 75 to 90
+    effective_fov_deg=95.0,  # FULL coverage
     sigma_factor=0.25
 )
 Image.fromarray(erp_gaussian).save(f"{output_dir}/erp_gaussian.png")

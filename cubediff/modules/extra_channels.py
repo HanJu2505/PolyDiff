@@ -81,7 +81,8 @@ def calculate_positional_encoding_18(resolution=(128, 128), fov_deg=95.0, view_c
         
         # Apply rotation: first yaw (around Y), then pitch (around X)
         yaw_rad = math.radians(yaw_deg)
-        pitch_rad = math.radians(pitch_deg)
+        # NEGATE pitch to match CubeDiff convention: pitch=+90 should look UP (+Y)
+        pitch_rad = math.radians(-pitch_deg)
         
         # Rotation around Y-axis (yaw)
         x_yaw = x * math.cos(yaw_rad) + z * math.sin(yaw_rad)

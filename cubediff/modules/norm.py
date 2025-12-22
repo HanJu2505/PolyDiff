@@ -20,6 +20,10 @@ class CubeDiffGroupNorm(nn.Module):
             self.norm.weight.data.copy_(original_norm.weight.data)
             self.norm.bias.data.copy_(original_norm.bias.data)
 
+        # Ensure dtype and device match original (critical for fp16)
+        if hasattr(original_norm, 'weight') and original_norm.weight is not None:
+            self.norm = self.norm.to(dtype=original_norm.weight.dtype, device=original_norm.weight.device)
+
     def forward(self, x):
         """
         x: (B*T, C, H, W) or (B*T, C, H*W) → Cube-aware reshape → Apply shared GroupNorm → reshape back

@@ -7,7 +7,7 @@ Generate 360° panoramas using 18-view over-complete generation.
 import torch
 import os
 from PIL import Image
-from torchvision import transforms
+import torchvision.transforms as T
 from cubediff.pipelines.polydiff_pipeline import PolyDiffPipeline
 from cubediff.modules.geometry import VIEW_NAMES_18
 
@@ -18,7 +18,7 @@ if __name__ == "__main__":
     
     # Image filename (anchor/front view)
     # IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/202_img_.png"
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030001_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png"
 
     # Prompts: can be a single string, list of 18 strings, or dict with directional keys
     # Option 1: Single prompt for all views
@@ -36,13 +36,13 @@ if __name__ == "__main__":
     # }
 
     PROMPTS = {
-        "Front": "Pool is next to lifeguard tower; trees in background.",
-        "Right": "Diving board is next to pool and fence.",
-        "Back": "Pool and slide are near trees.",
-        "Left": "Pool with slide is surrounded by trees.",
-        "Top": "sky with cloud",
-        "Bottom": "Pool with slide",
-        "Overall": "Pool occupies central area; trees surround perimeter, diving board and lifeguard tower at edges."
+        "Front": "Person walks on cobblestone street",
+        "Right": "Statue stands before building; chairs and umbrellas nearby.",
+        "Back": "Statues stand before buildings across left and right rear views",
+        "Left": "Statue stands before buildings",
+        "Top": "sky with sun",
+        "Bottom": "street area",
+        "Overall": "Multiple statues, buildings, umbrellas, chairs, and people distributed around a central street area."
     }
     
     # Model checkpoint path (CubeDiff checkpoint)
@@ -61,37 +61,46 @@ if __name__ == "__main__":
     
     # Fusion parameters
     # "wta" = Winner-Takes-All (for debugging coordinate alignment)
-    # "gaussian" = Soft blending (for final output)
-    FUSION_MODE = "wta"
-    EFFECTIVE_FOV = 70.0  # Only use center 70° of each 95° view
+    # "gaussian" = Soft blending (all views equal weight)
+    # "tiered" = Main views priority + seam views for edge blending (RECOMMENDED)
+    FUSION_MODE = "tiered"
+    # IMPORTANT: Must be >= FOV_DEG to ensure full coverage from 6 main views
+    EFFECTIVE_FOV = 90.0  # Only used for wta/gaussian modes
+    
+    # New: Two-Stage Generation
+    TWO_STAGE = True
     
     # ================================================
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # ---------------- Load Pipeline ----------------
-    print(f"Loading PolyDiff-18 pipeline from: {CHECKPOINT}")
-    pipe = PolyDiffPipeline.from_pretrained(CHECKPOINT)
-    pipe = pipe.to(device)
-    print(f"Pipeline loaded successfully and moved to {device}")
-
-    image_size = pipe.vae.config.sample_size
-
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    
+    # Load pipeline
+    print(f"[INFO] Loading PolyDiff Pipeline from {CHECKPOINT}...")
+    pipe = PolyDiffPipeline.from_pretrained(
+        CHECKPOINT,
+        num_faces=18 
+    ).to(device)
+    
+    # Load conditioning image (Front view anchor)
+    print(f"[INFO] Loading conditioning image {IMAGE_FILENAME}...")
+    
+    image_size = pipe.vae.config.sample_size  # Should be 64 for latent, but 512 for input
+    
+    transform = T.Compose([
+        T.Resize((512, 512)),
+        T.ToTensor(),
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
     ])
+    
+    image = Image.open(IMAGE_FILENAME).convert("RGB")
+    conditioning_image = transform(image)
 
     # Ensure output directory exists
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    print(f"\n[INFO] Loading anchor image: {IMAGE_FILENAME}")
-    image = Image.open(IMAGE_FILENAME).convert("RGB")
-    conditioning_image = transform(image)
-
     print("\n" + "="*60)
     print("[INFO] Starting PolyDiff-18 panorama generation...")
+    print(f"       Mode: {'Two-Stage' if TWO_STAGE else 'Single-Stage'}")
     print("="*60)
     
     output = pipe(
@@ -104,6 +113,7 @@ if __name__ == "__main__":
         erp_width=ERP_WIDTH,
         fusion_mode=FUSION_MODE,
         effective_fov_deg=EFFECTIVE_FOV,
+        two_stage=TWO_STAGE,
     )
 
     # ---------------- Save Results ----------------
