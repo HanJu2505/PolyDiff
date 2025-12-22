@@ -18,13 +18,13 @@ for i, name in enumerate(VIEW_NAMES_18):
 
 print(f"\nTotal views: {len(views)}")
 
-# Test WTA fusion
+# Test WTA fusion with larger effective FOV
 print("\n===== Testing WTA (Winner-Takes-All) =====")
 erp_wta = inverse_mapping_fusion(
     views, VIEW_CONFIG_18, 
     fov_deg=95.0,
     mode="wta",
-    effective_fov_deg=70.0
+    effective_fov_deg=90.0  # Increased from 70 to 90
 )
 Image.fromarray(erp_wta).save(f"{output_dir}/erp_wta.png")
 print(f"Saved to {output_dir}/erp_wta.png")
@@ -35,8 +35,8 @@ erp_gaussian = inverse_mapping_fusion(
     views, VIEW_CONFIG_18, 
     fov_deg=95.0,
     mode="gaussian",
-    effective_fov_deg=75.0,
-    sigma_factor=0.2
+    effective_fov_deg=90.0,  # Increased from 75 to 90
+    sigma_factor=0.25
 )
 Image.fromarray(erp_gaussian).save(f"{output_dir}/erp_gaussian.png")
 print(f"Saved to {output_dir}/erp_gaussian.png")

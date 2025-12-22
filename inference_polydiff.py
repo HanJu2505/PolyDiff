@@ -41,7 +41,7 @@ if __name__ == "__main__":
         "Back": "Pool and slide are near trees.",
         "Left": "Pool with slide is surrounded by trees.",
         "Top": "sky with cloud",
-        "Bottom": "Pool with slide is surrounded by trees.",
+        "Bottom": "Pool with slide",
         "Overall": "Pool occupies central area; trees surround perimeter, diving board and lifeguard tower at edges."
     }
     
