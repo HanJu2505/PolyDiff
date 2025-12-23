@@ -5,6 +5,7 @@ This script:
 1. Loads 6 faces from CubeDiff output
 2. Repairs all 12 seams using SD Inpainting
 3. Converts to ERP panorama
+python run_seam_repair.py --debug --steps 15 --strength 0.55 --seam_width 50 --feather 20
 """
 
 import os
@@ -167,8 +168,8 @@ def main():
     pipe = create_inpaint_pipeline()
     inpaint_fn = make_inpaint_fn(
         pipe, 
-        prompt="seamless natural texture, high quality",
-        negative_prompt="seam, edge, discontinuity, artifact",
+        prompt="seamless transition, continuous structure, smooth blending, unified texture, high quality",
+        negative_prompt="visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
         num_inference_steps=args.steps,
         strength=args.strength
     )

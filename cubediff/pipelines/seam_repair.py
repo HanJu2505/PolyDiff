@@ -71,24 +71,31 @@ def cartesian_to_spherical(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> Tuple
 def rotate_vector(x: np.ndarray, y: np.ndarray, z: np.ndarray, 
                   yaw_rad: float, pitch_rad: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply yaw then pitch rotation to a 3D vector.
+    Apply intrinsic yaw-pitch rotation to a 3D vector.
+    
+    For intrinsic rotations (camera-centric):
+    - Yaw: rotation around world Y-axis
+    - Pitch: rotation around camera's local X-axis (after yaw)
+    
+    The correct order for R = R_yaw * R_pitch is to apply pitch FIRST, then yaw.
     
     Convention:
-    - Yaw: rotation around Y-axis (azimuth)
-    - Pitch: rotation around X-axis (elevation), positive = look up
+    - +yaw = rotate right (clockwise when viewed from above)
+    - +pitch = look up
     """
-    # Yaw rotation (around Y-axis)
-    cos_y, sin_y = np.cos(yaw_rad), np.sin(yaw_rad)
-    x_yaw = x * cos_y + z * sin_y
-    z_yaw = -x * sin_y + z * cos_y
-    y_yaw = y
-    
-    # Pitch rotation (around X-axis), negate to match CubeDiff convention
-    pitch_rad = -pitch_rad  # +pitch = look UP
+    # Step 1: Apply pitch first (around X-axis)
+    # Negate pitch so +pitch = look UP
+    pitch_rad = -pitch_rad
     cos_p, sin_p = np.cos(pitch_rad), np.sin(pitch_rad)
-    y_rot = y_yaw * cos_p - z_yaw * sin_p
-    z_rot = y_yaw * sin_p + z_yaw * cos_p
-    x_rot = x_yaw
+    x_pitch = x
+    y_pitch = y * cos_p - z * sin_p
+    z_pitch = y * sin_p + z * cos_p
+    
+    # Step 2: Apply yaw (around Y-axis)
+    cos_y, sin_y = np.cos(yaw_rad), np.sin(yaw_rad)
+    x_rot = x_pitch * cos_y + z_pitch * sin_y
+    z_rot = -x_pitch * sin_y + z_pitch * cos_y
+    y_rot = y_pitch
     
     return x_rot, y_rot, z_rot
 
@@ -96,20 +103,23 @@ def rotate_vector(x: np.ndarray, y: np.ndarray, z: np.ndarray,
 def unrotate_vector(x: np.ndarray, y: np.ndarray, z: np.ndarray,
                     yaw_rad: float, pitch_rad: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Apply inverse rotation (undo pitch then yaw) to a 3D vector.
-    """
-    # Undo pitch (around X-axis)
-    pitch_rad = -pitch_rad  # Match rotation convention
-    cos_p, sin_p = np.cos(-pitch_rad), np.sin(-pitch_rad)
-    y_unpitch = y * cos_p - z * sin_p
-    z_unpitch = y * sin_p + z * cos_p
-    x_unpitch = x
+    Apply inverse rotation (undo the rotation from rotate_vector).
     
-    # Undo yaw (around Y-axis)
+    Since rotate_vector does: pitch first, then yaw
+    Inverse is: undo yaw first, then undo pitch
+    """
+    # Step 1: Undo yaw (around Y-axis, negative angle)
     cos_y, sin_y = np.cos(-yaw_rad), np.sin(-yaw_rad)
-    x_unrot = x_unpitch * cos_y + z_unpitch * sin_y
-    z_unrot = -x_unpitch * sin_y + z_unpitch * cos_y
-    y_unrot = y_unpitch
+    x_unyaw = x * cos_y + z * sin_y
+    z_unyaw = -x * sin_y + z * cos_y
+    y_unyaw = y
+    
+    # Step 2: Undo pitch (around X-axis, positive angle since we negated in forward)
+    # In rotate_vector we used -pitch_rad, so to undo we use +pitch_rad
+    cos_p, sin_p = np.cos(pitch_rad), np.sin(pitch_rad)
+    x_unrot = x_unyaw
+    y_unrot = y_unyaw * cos_p - z_unyaw * sin_p
+    z_unrot = y_unyaw * sin_p + z_unyaw * cos_p
     
     return x_unrot, y_unrot, z_unrot
 
@@ -118,6 +128,10 @@ def project_to_cubemap_face(x: np.ndarray, y: np.ndarray, z: np.ndarray,
                             face_idx: int, face_size: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Project 3D direction vectors to pixel coordinates on a cubemap face.
+    
+    A point belongs to a face only if:
+    1. It faces that direction (correct sign)
+    2. That axis is DOMINANT (has largest absolute value)
     
     Args:
         x, y, z: 3D direction vectors
@@ -129,31 +143,34 @@ def project_to_cubemap_face(x: np.ndarray, y: np.ndarray, z: np.ndarray,
         valid: Boolean mask for valid projections
     """
     half_size = face_size / 2.0
+    abs_x, abs_y, abs_z = np.abs(x), np.abs(y), np.abs(z)
     
     if face_idx == 0:  # Front (+Z)
-        valid = z > 0
-        px = (x / z) * half_size + half_size
-        py = (-y / z) * half_size + half_size
+        # Valid if z > 0 AND z is the dominant axis
+        valid = (z > 0) & (abs_z >= abs_x) & (abs_z >= abs_y)
+        px = (x / (z + 1e-10)) * half_size + half_size
+        py = (-y / (z + 1e-10)) * half_size + half_size
     elif face_idx == 1:  # Back (-Z)
-        valid = z < 0
-        px = (x / z) * half_size + half_size  # Note: x/z flips sign
-        py = (y / z) * half_size + half_size
+        valid = (z < 0) & (abs_z >= abs_x) & (abs_z >= abs_y)
+        px = (-x / (-z + 1e-10)) * half_size + half_size
+        py = (-y / (-z + 1e-10)) * half_size + half_size
     elif face_idx == 2:  # Left (-X)
-        valid = x < 0
-        px = (z / x) * half_size + half_size
-        py = (y / x) * half_size + half_size
+        valid = (x < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)
+        # Looking at -X: +Z is to the RIGHT, +Y is UP
+        px = (z / (-x + 1e-10)) * half_size + half_size  # Fixed: was -z
+        py = (-y / (-x + 1e-10)) * half_size + half_size
     elif face_idx == 3:  # Right (+X)
-        valid = x > 0
-        px = (-z / x) * half_size + half_size
-        py = (-y / x) * half_size + half_size
+        valid = (x > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)
+        px = (-z / (x + 1e-10)) * half_size + half_size
+        py = (-y / (x + 1e-10)) * half_size + half_size
     elif face_idx == 4:  # Top (+Y)
-        valid = y > 0
-        px = (x / y) * half_size + half_size
-        py = (z / y) * half_size + half_size
+        valid = (y > 0) & (abs_y >= abs_x) & (abs_y >= abs_z)
+        px = (x / (y + 1e-10)) * half_size + half_size
+        py = (z / (y + 1e-10)) * half_size + half_size
     elif face_idx == 5:  # Bottom (-Y)
-        valid = y < 0
-        px = (-x / y) * half_size + half_size
-        py = (z / y) * half_size + half_size
+        valid = (y < 0) & (abs_y >= abs_x) & (abs_y >= abs_z)
+        px = (x / (-y + 1e-10)) * half_size + half_size
+        py = (-z / (-y + 1e-10)) * half_size + half_size
     else:
         raise ValueError(f"Invalid face_idx: {face_idx}")
     
@@ -257,27 +274,39 @@ def paste_back_to_face(seam_view: np.ndarray,
     # Convert face pixels to 3D direction vectors
     half_size = face_size / 2.0
     
-    if face_idx == 0:  # Front
+    if face_idx == 0:  # Front (+Z)
+        # project: px = x/z, py = -y/z
+        # inverse: x = (face_u - half)/half, y = -(face_v - half)/half, z = 1
         fx = (face_u - half_size) / half_size
         fy = -(face_v - half_size) / half_size
         fz = np.ones_like(fx)
-    elif face_idx == 1:  # Back
+    elif face_idx == 1:  # Back (-Z)
+        # project: px = -x/-z, py = -y/-z
+        # inverse: x = -(face_u - half)/half, y = -(face_v - half)/half, z = -1
         fx = -(face_u - half_size) / half_size
         fy = -(face_v - half_size) / half_size
         fz = -np.ones_like(fx)
-    elif face_idx == 2:  # Left
+    elif face_idx == 2:  # Left (-X)
+        # project: px = z/-x, py = -y/-x
+        # inverse: z = (face_u - half)/half * (-x), y = -(face_v - half)/half * (-x)
         fx = -np.ones_like(face_u, dtype=float)
         fy = -(face_v - half_size) / half_size
-        fz = -(face_u - half_size) / half_size
-    elif face_idx == 3:  # Right
+        fz = (face_u - half_size) / half_size  # Fixed: was negative
+    elif face_idx == 3:  # Right (+X)
+        # project: px = -z/x, py = -y/x
+        # inverse: z = -(face_u - half)/half, y = -(face_v - half)/half, x = 1
         fx = np.ones_like(face_u, dtype=float)
         fy = -(face_v - half_size) / half_size
-        fz = (face_u - half_size) / half_size
-    elif face_idx == 4:  # Top
+        fz = -(face_u - half_size) / half_size  # Fixed: was positive
+    elif face_idx == 4:  # Top (+Y)
+        # project: px = x/y, py = z/y
+        # inverse: x = (face_u - half)/half, z = (face_v - half)/half, y = 1
         fx = (face_u - half_size) / half_size
         fy = np.ones_like(face_u, dtype=float)
         fz = (face_v - half_size) / half_size
-    elif face_idx == 5:  # Bottom
+    elif face_idx == 5:  # Bottom (-Y)
+        # project: px = x/-y, py = -z/-y
+        # inverse: x = (face_u - half)/half, z = -(face_v - half)/half, y = -1
         fx = (face_u - half_size) / half_size
         fy = -np.ones_like(face_u, dtype=float)
         fz = -(face_v - half_size) / half_size
@@ -317,33 +346,141 @@ def paste_back_to_face(seam_view: np.ndarray,
 
 def create_seam_mask(size: int = 512, 
                      seam_width: int = 64,
-                     feather: int = 32) -> np.ndarray:
+                     feather: int = 32,
+                     horizontal: bool = False) -> np.ndarray:
     """
-    Create a vertical strip mask for seam inpainting.
-    
-    The mask is centered horizontally with feathered (gradient) edges.
-    
-    Args:
-        size: Image size
-        seam_width: Width of the core mask area (will be 1.0)
-        feather: Width of gradient transition on each side
-    
-    Returns:
-        Mask array [size, size] with values 0-1
+    Create a simple strip mask for seam inpainting (legacy function).
     """
     mask = np.zeros((size, size), dtype=np.float32)
     center = size // 2
     
-    for x in range(size):
-        dist_from_center = abs(x - center)
+    for i in range(size):
+        dist_from_center = abs(i - center)
         
         if dist_from_center <= seam_width // 2:
-            # Core area
-            mask[:, x] = 1.0
+            value = 1.0
         elif dist_from_center <= seam_width // 2 + feather:
-            # Feather area
             t = (dist_from_center - seam_width // 2) / feather
-            mask[:, x] = 1.0 - t
+            value = 1.0 - t
+        else:
+            value = 0.0
+        
+        if horizontal:
+            mask[i, :] = value
+        else:
+            mask[:, i] = value
+    
+    return mask
+
+
+def create_precise_seam_mask(face_a_idx: int, face_b_idx: int,
+                             yaw_deg: float, pitch_deg: float,
+                             size: int = 512,
+                             fov_deg: float = 90.0,
+                             seam_width: int = 64,
+                             feather: int = 32,
+                             corner_margin: float = 0.15) -> np.ndarray:
+    """
+    Create a seam mask: simple strip intersected with rectangular region.
+    
+    For equator edges (0-3): vertical strip with top/bottom margins
+    For polar edges (4-11): horizontal strip with left/right margins
+    
+    Args:
+        face_a_idx, face_b_idx: Indices of the two adjacent faces
+        yaw_deg, pitch_deg: Seam camera orientation
+        size: Output mask size
+        fov_deg: Field of view of seam camera
+        seam_width: Width of the core seam area (full mask value)
+        feather: Width of gradient transition on each side
+        corner_margin: Fraction of image to exclude from edges (0-0.5)
+                       Default 0.30 (30%) excludes corner triangles for 90° FOV
+    
+    Returns:
+        Mask array [size, size] with values 0-1
+    """
+    yaw_rad = np.radians(yaw_deg)
+    pitch_rad = np.radians(pitch_deg)
+    
+    # Create seam view pixel grid
+    u, v = np.meshgrid(np.arange(size), np.arange(size))
+    
+    # Convert pixel coords to normalized camera coords
+    half_fov = np.tan(np.radians(fov_deg / 2))
+    nx = (u - size / 2) / (size / 2) * half_fov
+    ny = -(v - size / 2) / (size / 2) * half_fov
+    nz = np.ones_like(nx)
+    
+    # Normalize to unit vectors
+    norm = np.sqrt(nx**2 + ny**2 + nz**2)
+    nx, ny, nz = nx / norm, ny / norm, nz / norm
+    
+    # Rotate to world coordinates
+    wx, wy, wz = rotate_vector(nx, ny, nz, yaw_rad, pitch_rad)
+    
+    # Determine which face each pixel belongs to (based on dominant axis)
+    abs_x, abs_y, abs_z = np.abs(wx), np.abs(wy), np.abs(wz)
+    
+    # Face assignment
+    face_map = np.full((size, size), -1, dtype=np.int32)
+    
+    # Front (+Z)
+    mask_front = (wz > 0) & (abs_z >= abs_x) & (abs_z >= abs_y)
+    face_map = np.where(mask_front, 0, face_map)
+    # Back (-Z)
+    mask_back = (wz < 0) & (abs_z >= abs_x) & (abs_z >= abs_y)
+    face_map = np.where(mask_back, 1, face_map)
+    # Left (-X)
+    mask_left = (wx < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)
+    face_map = np.where(mask_left, 2, face_map)
+    # Right (+X)
+    mask_right = (wx > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)
+    face_map = np.where(mask_right, 3, face_map)
+    # Top (+Y)
+    mask_top = (wy > 0) & (abs_y >= abs_x) & (abs_y >= abs_z)
+    face_map = np.where(mask_top, 4, face_map)
+    # Bottom (-Y)
+    mask_bottom = (wy < 0) & (abs_y >= abs_x) & (abs_y >= abs_z)
+    face_map = np.where(mask_bottom, 5, face_map)
+    
+    # Determine if this is a polar edge (horizontal seam) or equator edge (vertical seam)
+    is_polar_edge = (abs(pitch_deg) > 1.0)
+    
+    # Use fixed rectangular region with configurable margin
+    # corner_margin = 0.30 means exclude 30% from edges where corner triangles appear
+    margin = int(size * corner_margin)
+    
+    # Create rectangular mask with margins
+    rect_mask = np.zeros((size, size), dtype=np.float32)
+    if is_polar_edge:
+        # Horizontal seam: exclude left/right corners
+        rect_mask[:, margin:size-margin] = 1.0
+    else:
+        # Vertical seam: exclude top/bottom corners
+        rect_mask[margin:size-margin, :] = 1.0
+    
+    # Create simple strip mask
+    strip_mask = np.zeros((size, size), dtype=np.float32)
+    center = size // 2
+    
+    for i in range(size):
+        dist_from_center = abs(i - center)
+        
+        if dist_from_center <= seam_width // 2:
+            value = 1.0
+        elif dist_from_center <= seam_width // 2 + feather:
+            t = (dist_from_center - seam_width // 2) / feather
+            value = 1.0 - t
+        else:
+            value = 0.0
+        
+        if is_polar_edge:
+            strip_mask[i, :] = value  # Horizontal strip
+        else:
+            strip_mask[:, i] = value  # Vertical strip
+    
+    # Final mask = strip mask × rectangular bounding box
+    mask = strip_mask * rect_mask
     
     return mask
 
@@ -351,8 +488,8 @@ def create_seam_mask(size: int = 512,
 def repair_single_seam(faces: List[np.ndarray],
                        edge_id: int,
                        inpaint_fn,
-                       seam_width: int = 64,
-                       feather: int = 32,
+                       seam_width: int = 100,
+                       feather: int = 50,
                        debug_dir: Optional[str] = None) -> List[np.ndarray]:
     """
     Repair a single seam between two adjacent faces.
@@ -382,9 +519,15 @@ def repair_single_seam(faces: List[np.ndarray],
         yaw_deg, pitch_deg
     )
     
-    # Step 2: Create mask
+    # Step 2: Create precise seam mask that follows actual face boundary
     size = seam_view.shape[0]
-    mask = create_seam_mask(size, seam_width, feather)
+    mask = create_precise_seam_mask(
+        face_a_idx, face_b_idx,
+        yaw_deg, pitch_deg,
+        size=size,
+        seam_width=seam_width,
+        feather=feather
+    )
     
     if debug_dir:
         Image.fromarray(seam_view).save(f"{debug_dir}/edge{edge_id}_before.png")
@@ -411,8 +554,8 @@ def repair_single_seam(faces: List[np.ndarray],
 
 def repair_all_seams(faces: List[np.ndarray],
                      inpaint_fn,
-                     seam_width: int = 64,
-                     feather: int = 32,
+                     seam_width: int = 100,
+                     feather: int = 50,
                      debug_dir: Optional[str] = None) -> List[np.ndarray]:
     """
     Repair all 12 seams of a cubemap.
