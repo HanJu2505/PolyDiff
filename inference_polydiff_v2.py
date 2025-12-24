@@ -1,12 +1,12 @@
 """
-PolyDiff Inference Script (2-Stage Pipeline)
+PolyDiff Inference Script (2-Stage Pipeline with Edge-by-Edge Seam Repair)
 
 Generate 360° panoramas using:
   Stage 1: Generate 6 main cubemap faces using CubeDiff
-  Stage 2: Repair seams using ERP-level SD Inpainting
+  Stage 2: Repair 12 seams individually using SD Inpainting
 
 Usage:
-    python inference_polydiff.py
+    python inference_polydiff_v2.py 
 """
 
 import torch
@@ -18,9 +18,10 @@ import py360convert
 
 # Use original CubeDiff pipeline for 6-view generation
 from cubediff.pipelines.cubediff_pipeline import CubeDiffPipeline
+from cubediff.pipelines.seam_repair import repair_all_seams, FACE_NAMES
 
-# 6 main view names
-FACE_NAMES = ["front", "back", "left", "right", "top", "bottom"]
+# For SD Inpainting
+from diffusers import StableDiffusionInpaintPipeline
 
 
 def faces_to_erp(faces, erp_height=1024, erp_width=2048):
@@ -36,88 +37,49 @@ def faces_to_erp(faces, erp_height=1024, erp_width=2048):
     return py360convert.c2e(cube_dict, h=erp_height, w=erp_width, cube_format='dict')
 
 
-def create_face_edge_mask(size: int = 512, 
-                          edge_width: int = 24, 
-                          feather: int = 12) -> np.ndarray:
-    """Create a face mask with white edges and black center."""
-    mask = np.zeros((size, size), dtype=np.float32)
-    
-    for i in range(size):
-        for j in range(size):
-            dist_from_edge = min(i, j, size - 1 - i, size - 1 - j)
-            
-            if dist_from_edge < edge_width:
-                mask[i, j] = 1.0
-            elif dist_from_edge < edge_width + feather:
-                t = (dist_from_edge - edge_width) / feather
-                mask[i, j] = 1.0 - t
-    
-    return mask
-
-
-def masks_to_erp(masks, erp_height=1024, erp_width=2048):
-    """Convert 6 face masks to ERP mask."""
-    masks_uint8 = [(m * 255).astype(np.uint8) for m in masks]
-    masks_3ch = [np.stack([m, m, m], axis=-1) for m in masks_uint8]
-    erp_mask_3ch = faces_to_erp(masks_3ch, erp_height, erp_width)
-    erp_mask = erp_mask_3ch[:, :, 0].astype(np.float32) / 255.0
-    return erp_mask
-
-
-def create_inpaint_pipeline(device="cuda"):
-    """Create SD Inpainting Pipeline."""
-    from diffusers import StableDiffusionInpaintPipeline
+def create_inpaint_fn(device="cuda", 
+                      prompt="seamless transition, continuous structure, smooth blending, unified texture, high quality",
+                      negative_prompt="visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
+                      num_inference_steps=20, 
+                      strength=0.55):
+    """Create SD Inpainting function for seam repair."""
     
     print("[Inpaint] Loading SD Inpainting model...")
     pipe = StableDiffusionInpaintPipeline.from_pretrained(
         "runwayml/stable-diffusion-inpainting",
         torch_dtype=torch.float16,
         safety_checker=None,
-    )
-    pipe = pipe.to(device)
+    ).to(device)
     pipe.set_progress_bar_config(disable=True)
     print("[Inpaint] Model loaded.")
-    return pipe
-
-
-def inpaint_erp(pipe, erp_image: np.ndarray, erp_mask: np.ndarray,
-                prompt: str = "seamless transition, continuous structure, smooth blending, unified texture, high quality",
-                negative_prompt: str = "visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
-                num_inference_steps: int = 20,
-                strength: float = 0.6) -> np.ndarray:
-    """Inpaint ERP image using SD Inpainting with smart blending."""
-    from PIL import Image as PILImage
     
-    original_h, original_w = erp_image.shape[:2]
-    sd_size = (1024, 512)
+    def inpaint_fn(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Inpaint the masked region."""
+        pil_image = Image.fromarray(image)
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        pil_mask = Image.fromarray(mask_uint8)
+        
+        original_size = pil_image.size
+        if original_size != (512, 512):
+            pil_image = pil_image.resize((512, 512), Image.LANCZOS)
+            pil_mask = pil_mask.resize((512, 512), Image.NEAREST)
+        
+        result = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=pil_image,
+            mask_image=pil_mask,
+            num_inference_steps=num_inference_steps,
+            strength=strength,
+            guidance_scale=3.0,
+        ).images[0]
+        
+        if result.size != original_size:
+            result = result.resize(original_size, Image.LANCZOS)
+        
+        return np.array(result)
     
-    # Step 1: Downsample
-    pil_image_lowres = PILImage.fromarray(erp_image).resize(sd_size, PILImage.LANCZOS)
-    mask_uint8 = (erp_mask * 255).astype(np.uint8)
-    pil_mask_lowres = PILImage.fromarray(mask_uint8).resize(sd_size, PILImage.LANCZOS)
-    
-    # Step 2: Inpaint
-    print(f"[Inpaint] Running inpainting (steps={num_inference_steps}, strength={strength})")
-    result_lowres = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image=pil_image_lowres,
-        mask_image=pil_mask_lowres,
-        num_inference_steps=num_inference_steps,
-        strength=strength,
-        guidance_scale=3.0,
-    ).images[0]
-    
-    # Step 3: Upsample
-    result_upsampled = result_lowres.resize((original_w, original_h), PILImage.LANCZOS)
-    result_upsampled = np.array(result_upsampled)
-    
-    # Step 4: Smart blend
-    mask_3ch = np.stack([erp_mask, erp_mask, erp_mask], axis=-1)
-    result_blended = (mask_3ch * result_upsampled + 
-                      (1 - mask_3ch) * erp_image).astype(np.uint8)
-    
-    return result_blended
+    return inpaint_fn
 
 
 if __name__ == "__main__":
@@ -141,7 +103,7 @@ if __name__ == "__main__":
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
-    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff/"
+    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_v2/"
     
     # Generation parameters
     CFG_SCALE = 3.5
@@ -149,16 +111,20 @@ if __name__ == "__main__":
     ERP_HEIGHT = 1024
     ERP_WIDTH = 2048
     
-    # Seam repair parameters
-    EDGE_WIDTH = 24
-    FEATHER = 12
-    INPAINT_STEPS = 20
+    # Seam repair parameters (edge-by-edge)
+    SEAM_WIDTH = 50      # Width of seam region
+    FEATHER = 20          # Feather width for blending
+    INPAINT_STEPS = 15    # Inpainting steps per edge
     INPAINT_STRENGTH = 0.55
+    DEBUG_SEAMS = True    # Save debug images for each edge
     
     # ================================================
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    debug_dir = os.path.join(OUTPUT_DIR, "debug") if DEBUG_SEAMS else None
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
     
     # =================== STAGE 1: Generate 6 Faces ===================
     print("\n" + "="*60)
@@ -197,11 +163,11 @@ if __name__ == "__main__":
         cfg_scale=CFG_SCALE,
     )
     
-    # Save face images
+    # Save face images and get arrays
     print("\n[INFO] Saving 6 face images...")
-    faces = output.images
+    faces_pil = output.images
     face_arrays = []
-    for face_img, name in zip(faces, FACE_NAMES):
+    for face_img, name in zip(faces_pil, FACE_NAMES):
         face_path = os.path.join(OUTPUT_DIR, f"{name}.png")
         face_img.save(face_path)
         face_arrays.append(np.array(face_img))
@@ -217,32 +183,38 @@ if __name__ == "__main__":
     del cubediff_pipe
     torch.cuda.empty_cache()
     
-    # =================== STAGE 2: Seam Repair ===================
+    # =================== STAGE 2: Edge-by-Edge Seam Repair ===================
     print("\n" + "="*60)
-    print("[Stage 2] Repairing seams with SD Inpainting...")
+    print("[Stage 2] Repairing 12 seams with edge-by-edge SD Inpainting...")
+    print(f"         (seam_width={SEAM_WIDTH}, feather={FEATHER})")
     print("="*60)
     
-    # Create edge masks
-    print(f"[INFO] Creating edge masks (edge_width={EDGE_WIDTH}, feather={FEATHER})...")
-    face_masks = [create_face_edge_mask(512, EDGE_WIDTH, FEATHER) for _ in range(6)]
-    
-    # Project to ERP mask
-    print("[INFO] Projecting masks to ERP...")
-    erp_mask = masks_to_erp(face_masks, ERP_HEIGHT, ERP_WIDTH)
-    Image.fromarray((erp_mask * 255).astype(np.uint8)).save(os.path.join(OUTPUT_DIR, "erp_mask.png"))
-    print("  ✓ Saved erp_mask.png")
-    
-    # Load SD Inpainting
-    inpaint_pipe = create_inpaint_pipeline(device)
-    
-    # Inpaint ERP
-    erp_after = inpaint_erp(
-        inpaint_pipe, erp_before, erp_mask,
+    # Create inpainting function
+    inpaint_fn = create_inpaint_fn(
+        device=device,
         num_inference_steps=INPAINT_STEPS,
         strength=INPAINT_STRENGTH
     )
     
-    # Save repaired ERP
+    # Repair all 12 seams
+    repaired_faces = repair_all_seams(
+        face_arrays,
+        inpaint_fn,
+        seam_width=SEAM_WIDTH,
+        feather=FEATHER,
+        debug_dir=debug_dir
+    )
+    
+    # Save repaired faces
+    print("\n[INFO] Saving repaired faces...")
+    for face_arr, name in zip(repaired_faces, FACE_NAMES):
+        face_path = os.path.join(OUTPUT_DIR, f"{name}_repaired.png")
+        Image.fromarray(face_arr).save(face_path)
+        print(f"  ✓ Saved {name}_repaired.png")
+    
+    # Create repaired ERP
+    print("\n[INFO] Creating ERP panorama (after repair)...")
+    erp_after = faces_to_erp(repaired_faces, ERP_HEIGHT, ERP_WIDTH)
     Image.fromarray(erp_after).save(os.path.join(OUTPUT_DIR, "erp_after.png"))
     print("  ✓ Saved erp_after.png")
     
@@ -254,6 +226,8 @@ if __name__ == "__main__":
     print("✅ Pipeline complete!")
     print(f"[INFO] Output saved to: {OUTPUT_DIR}")
     print("  - erp_before.png: Before seam repair")
-    print("  - erp_after.png: After seam repair")
+    print("  - erp_after.png: After seam repair (12 edges)")
     print("  - equirectangular.png: Final output")
+    if DEBUG_SEAMS:
+        print(f"  - debug/: Debug images for each edge")
     print("="*60)

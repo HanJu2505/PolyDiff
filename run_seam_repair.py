@@ -126,7 +126,7 @@ def faces_to_erp(faces, erp_height=1024, erp_width=2048):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input_dir", type=str, default="output/030002_front_up_polydiff",
+    parser.add_argument("--input_dir", type=str, default="output/030003_front_up_polydiff",
                         help="Directory containing 6 face images")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Output directory (default: input_dir/seam_repaired)")
