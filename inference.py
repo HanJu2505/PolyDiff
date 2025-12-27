@@ -9,9 +9,10 @@ if __name__ == "__main__":
     # Modify these variables directly in the script
     
     # Image filename
-    IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/202_img_.png"  # Change this to your image filename   
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030003_front_up.png"
+    # IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/202_img_.png"  # Change this to your image filename   
     # Either "", or single prompt, or list of 6 prompts depending on the type of checkpoint you are loading
-    PROMPTS = "Underwater seabed spans all directions; divers, marine animals, and plants occupy space."
+    # PROMPTS = "Underwater seabed spans all directions; divers, marine animals, and plants occupy space."
     '''
     prompts=[
         "A car is on a road in front of a large building.",      # front
@@ -22,6 +23,14 @@ if __name__ == "__main__":
         "street"        # bottom
     ]
     '''
+    PROMPTS = [
+        "Church stands between two buildings",
+        "Cars parked along road with trees and sidewalk",
+        "Car parked by road, tree, and street light",
+        "Car parked by road, sidewalk, and trees",
+        "sky with cloud",
+        "street with sidewalk and road"
+    ]
     
     # Model checkpoint path
     CHECKPOINT = "./cubediff-512-multitxt"  # Change this to one of the three types of checkpoints

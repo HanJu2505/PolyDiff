@@ -2,7 +2,7 @@ import torch.nn as nn
 from einops import rearrange
 
 class CubeDiffGroupNorm(nn.Module):
-    def __init__(self, original_norm: nn.GroupNorm, num_faces: int = 18, sync_enabled: bool = True):
+    def __init__(self, original_norm: nn.GroupNorm, num_faces: int = 6, sync_enabled: bool = True):
         super().__init__()
         self.num_faces = num_faces
         self.sync_enabled = sync_enabled
@@ -19,10 +19,6 @@ class CubeDiffGroupNorm(nn.Module):
         if original_norm.affine:
             self.norm.weight.data.copy_(original_norm.weight.data)
             self.norm.bias.data.copy_(original_norm.bias.data)
-
-        # Ensure dtype and device match original (critical for fp16)
-        if hasattr(original_norm, 'weight') and original_norm.weight is not None:
-            self.norm = self.norm.to(dtype=original_norm.weight.dtype, device=original_norm.weight.device)
 
     def forward(self, x):
         """

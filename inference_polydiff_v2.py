@@ -17,7 +17,7 @@ import numpy as np
 import py360convert
 
 # Use original CubeDiff pipeline for 6-view generation
-from cubediff.pipelines.cubediff_pipeline import CubeDiffPipeline
+from cubediff.pipelines.pipeline import CubeDiffPipeline
 from cubediff.pipelines.seam_repair import repair_all_seams, FACE_NAMES
 
 # For SD Inpainting
@@ -38,7 +38,7 @@ def faces_to_erp(faces, erp_height=1024, erp_width=2048):
 
 
 def create_inpaint_fn(device="cuda", 
-                      prompt="seamless transition, continuous structure, smooth blending, unified texture, high quality",
+                      prompt="seamless transition, continuous structure, unified texture, high quality,4K",
                       negative_prompt="visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
                       num_inference_steps=20, 
                       strength=0.55):
@@ -86,16 +86,16 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030003_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Church stands between two buildings",
-        "Right": "Car parked by road, sidewalk, and trees",
-        "Back": "Cars parked along road with trees and sidewalk",
-        "Left": "Car parked by road, tree, and street light",
-        "Top": "sky",
-        "Bottom": "street",
+        "Front": "Person walks on cobblestone street",
+        "Right": "Statue stands before building",
+        "Back": "Statues stand before buildings across left and right rear views",
+        "Left": "Statue stands before buildings",
+        "Top": "sky with sun",
+        "Bottom": "street with sidewalk and road",
     }
     
     # Model checkpoint (CubeDiff)
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     # Seam repair parameters (edge-by-edge)
     SEAM_WIDTH = 50      # Width of seam region
     FEATHER = 20          # Feather width for blending
-    INPAINT_STEPS = 15    # Inpainting steps per edge
+    INPAINT_STEPS = 20    # Inpainting steps per edge
     INPAINT_STRENGTH = 0.55
     DEBUG_SEAMS = True    # Save debug images for each edge
     
@@ -157,7 +157,7 @@ if __name__ == "__main__":
     
     # Generate 6 faces
     output = cubediff_pipe(
-        prompt=prompt_list,
+        prompts=prompt_list,
         conditioning_image=conditioning_image.unsqueeze(0).to(device),
         num_inference_steps=NUM_INFERENCE_STEPS,
         cfg_scale=CFG_SCALE,
@@ -165,12 +165,12 @@ if __name__ == "__main__":
     
     # Save face images and get arrays
     print("\n[INFO] Saving 6 face images...")
-    faces_pil = output.images
+    faces = output.faces_cropped  # numpy arrays [6, H, W, 3]
     face_arrays = []
-    for face_img, name in zip(faces_pil, FACE_NAMES):
+    for face_img, name in zip(faces, FACE_NAMES):
         face_path = os.path.join(OUTPUT_DIR, f"{name}.png")
-        face_img.save(face_path)
-        face_arrays.append(np.array(face_img))
+        Image.fromarray(face_img).save(face_path)
+        face_arrays.append(face_img)
         print(f"  ✓ Saved {name}.png")
     
     # Create ERP (before repair)

@@ -17,7 +17,7 @@ import numpy as np
 import py360convert
 
 # Use original CubeDiff pipeline for 6-view generation
-from cubediff.pipelines.cubediff_pipeline import CubeDiffPipeline
+from cubediff.pipelines.pipeline import CubeDiffPipeline
 
 # 6 main view names
 FACE_NAMES = ["front", "back", "left", "right", "top", "bottom"]
@@ -191,7 +191,7 @@ if __name__ == "__main__":
     
     # Generate 6 faces
     output = cubediff_pipe(
-        prompt=prompt_list,
+        prompts=prompt_list,
         conditioning_image=conditioning_image.unsqueeze(0).to(device),
         num_inference_steps=NUM_INFERENCE_STEPS,
         cfg_scale=CFG_SCALE,
@@ -199,12 +199,12 @@ if __name__ == "__main__":
     
     # Save face images
     print("\n[INFO] Saving 6 face images...")
-    faces = output.images
+    faces = output.faces_cropped  # numpy arrays [6, H, W, 3]
     face_arrays = []
     for face_img, name in zip(faces, FACE_NAMES):
         face_path = os.path.join(OUTPUT_DIR, f"{name}.png")
-        face_img.save(face_path)
-        face_arrays.append(np.array(face_img))
+        Image.fromarray(face_img).save(face_path)
+        face_arrays.append(face_img)
         print(f"  ✓ Saved {name}.png")
     
     # Create ERP (before repair)
