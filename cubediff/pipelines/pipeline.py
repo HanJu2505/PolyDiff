@@ -118,16 +118,31 @@ class CubeDiffPipeline(StableDiffusionPipeline):
                 do_classifier_free_guidance=(cfg_scale > 1.0),
             )
             
+            # ===== DEBUG: 打印嵌入形状 =====
+            print(f"\n[DEBUG] IP-Adapter image_embeds type: {type(image_embeds)}")
+            if isinstance(image_embeds, list):
+                print(f"[DEBUG] image_embeds list length: {len(image_embeds)}")
+                for i, emb in enumerate(image_embeds):
+                    print(f"[DEBUG] image_embeds[{i}] shape: {emb.shape}")
+            else:
+                print(f"[DEBUG] image_embeds shape: {image_embeds.shape}")
+            # ================================
+            
             # image_embeds is a list with one element per IP-Adapter
             # With batch_size=1 and 6 images + CFG, shape is [2, 6, num_tokens, dim]
             # Index 0 = uncond (negative), Index 1 = cond (positive)
             if isinstance(image_embeds, list):
                 image_embeds = image_embeds[0]  # Get first IP-Adapter's embeddings
             
+            print(f"[DEBUG] After extracting from list, image_embeds shape: {image_embeds.shape}")
+            
             # Split embeddings: [0] for uncond, [1] for cond
             # Each has shape [6, num_tokens, dim] after indexing
             uncond_image_embeds = [image_embeds[0]]  # List format for cross_attention_kwargs
             cond_image_embeds = [image_embeds[1]]
+            
+            print(f"[DEBUG] uncond_image_embeds[0] shape: {uncond_image_embeds[0].shape}")
+            print(f"[DEBUG] cond_image_embeds[0] shape: {cond_image_embeds[0].shape}\n")
 
         # 3. Initialize cross_attention_kwargs
         if cross_attention_kwargs is None:

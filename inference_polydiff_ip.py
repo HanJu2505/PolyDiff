@@ -129,37 +129,37 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/255_img_.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Person walks on cobblestone street",
-        "Right": "Statue stands before building",
-        "Back": "Statues stand before buildings across left and right rear views",
-        "Left": "Statue stands before buildings",
-        "Top": "sky with sun",
-        "Bottom": "street ",
+        "Front": "Jellyfish floats near starfish under water; Echinus lies at base.",
+        "Right": "Diver stands near sea floor; fish surround underwater habitat.",
+        "Back": "Fish occupy underwater space; diver is present in rear region.",
+        "Left": "Fish swim above ocean floor; cuttlefish rests below.",
+        "Top": "Ocean surface",
+        "Bottom": "seabed",
     }
     
     # ============== IP-ADAPTER CONFIGURATION ==============
     # Enable/disable IP-Adapter
-    USE_IP_ADAPTER = True
+    USE_IP_ADAPTER = True 
     
     # IP-Adapter model settings
     IP_ADAPTER_REPO = "h94/IP-Adapter"
     IP_ADAPTER_SUBFOLDER = "models"
     IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin"
-    IP_ADAPTER_SCALE = 0.5  # Weight for IP-Adapter influence (0.0 - 1.0)
+    IP_ADAPTER_SCALE = 0.99  # Weight for IP-Adapter influence (0.0 - 1.0)
     
     # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
     # Set to None to use conditioning image as reference
     FACE_REF_IMAGES = {
         "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_up.png",
-        "Left": "/home/dell/Datasets/Sun360/MiniVal_views/030002_left_back_up.png",
-        "Right": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_up.png",
-        "Top": "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png",
-        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_down.png",
+        "Back": "/home/dell/Datasets/UIEB/raw-90/242_img_.png",
+        "Left": "/home/dell/Datasets/UIEB/raw-90/243_img_.png",
+        "Right": "/home/dell/Datasets/UIEB/raw-90/244_img_.png",
+        "Top": "/home/dell/Datasets/UIEB/raw-90/245_img_.png",
+        "Bottom": "/home/dell/Datasets/UIEB/raw-90/246_img_.png",
     }
     
     # Alternative: Use a single image for all faces (global style)

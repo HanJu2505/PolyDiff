@@ -91,15 +91,15 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Person walks on cobblestone street",
-        "Right": "Statue stands before building",
-        "Back": "Statues stand before buildings across left and right rear views",
-        "Left": "Statue stands before buildings",
-        "Top": "sky with sun",
+        "Front": "Church stands between two buildings",
+        "Right": "Car parked by road, sidewalk, and trees",
+        "Back": "Cars parked along road with trees and sidewalk",
+        "Left": "Car parked by road, tree, and street light",
+        "Top": "sky",
         "Bottom": "street ",
     }
     
@@ -118,11 +118,11 @@ if __name__ == "__main__":
     # Or use the same image path for all faces for global style transfer
     FACE_REF_IMAGES = {
         "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_up.png",
-        "Left": "/home/dell/Datasets/Sun360/MiniVal_views/030002_left_back_up.png",
-        "Right": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_up.png",
-        "Top": "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png",
-        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_views/030002_right_back_down.png",
+        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
+        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
+        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
+        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
+        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
     }
     
     # Alternative: Use a single image for all faces (global style)
