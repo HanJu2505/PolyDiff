@@ -143,7 +143,7 @@ if __name__ == "__main__":
     
     # ============== IP-ADAPTER CONFIGURATION ==============
     # Enable/disable IP-Adapter
-    USE_IP_ADAPTER = True 
+    USE_IP_ADAPTER = False 
     
     # IP-Adapter model settings
     IP_ADAPTER_REPO = "h94/IP-Adapter"
