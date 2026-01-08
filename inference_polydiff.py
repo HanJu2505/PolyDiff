@@ -81,8 +81,8 @@ def create_inpaint_pipeline(device="cuda"):
 
 
 def inpaint_erp(pipe, erp_image: np.ndarray, erp_mask: np.ndarray,
-                prompt: str = "seamless transition, continuous structure, smooth blending, unified texture, high quality",
-                negative_prompt: str = "visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
+                prompt: str = "smooth blending, natural continuation, matching colors and textures, coherent scene, photorealistic",
+                negative_prompt: str = "abrupt change, color mismatch, inconsistent lighting, blurry, artificial, seam line, hard edge",
                 num_inference_steps: int = 20,
                 strength: float = 0.6) -> np.ndarray:
     """Inpaint ERP image using SD Inpainting with smart blending."""
@@ -179,15 +179,19 @@ if __name__ == "__main__":
     image = Image.open(IMAGE_FILENAME).convert("RGB")
     conditioning_image = transform(image)
     
-    # Prepare prompts
-    prompt_list = [
-        PROMPTS.get("Front", ""),
-        PROMPTS.get("Back", ""),
-        PROMPTS.get("Left", ""),
-        PROMPTS.get("Right", ""),
-        PROMPTS.get("Top", ""),
-        PROMPTS.get("Bottom", ""),
-    ]
+    # Prepare prompts - handle both dict and string formats
+    if isinstance(PROMPTS, dict):
+        prompt_list = [
+            PROMPTS.get("Front", ""),
+            PROMPTS.get("Back", ""),
+            PROMPTS.get("Left", ""),
+            PROMPTS.get("Right", ""),
+            PROMPTS.get("Top", ""),
+            PROMPTS.get("Bottom", ""),
+        ]
+    else:
+        # Single string prompt for all faces
+        prompt_list = [PROMPTS] * 6
     
     # Generate 6 faces
     output = cubediff_pipe(

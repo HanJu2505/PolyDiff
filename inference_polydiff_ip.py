@@ -86,8 +86,8 @@ def create_inpaint_pipeline(device="cuda"):
 
 
 def inpaint_erp(pipe, erp_image: np.ndarray, erp_mask: np.ndarray,
-                prompt: str = "seamless transition, continuous structure, smooth blending, unified texture, high quality",
-                negative_prompt: str = "visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
+                prompt: str = "smooth blending, natural continuation, matching colors and textures, coherent scene, photorealistic",
+                negative_prompt: str = "abrupt change, color mismatch, inconsistent lighting, blurry, artificial, seam line, hard edge",
                 num_inference_steps: int = 20,
                 strength: float = 0.6) -> np.ndarray:
     """Inpaint ERP image using SD Inpainting with smart blending."""
@@ -129,37 +129,37 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/255_img_.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Jellyfish floats near starfish under water; Echinus lies at base.",
-        "Right": "Diver stands near sea floor; fish surround underwater habitat.",
-        "Back": "Fish occupy underwater space; diver is present in rear region.",
-        "Left": "Fish swim above ocean floor; cuttlefish rests below.",
-        "Top": "Ocean surface",
-        "Bottom": "seabed",
+        "Front": "Church stands between two buildings",
+        "Right": "Car parked by road, sidewalk, and trees",
+        "Back": "Cars parked along road with trees and sidewalk",
+        "Left": "Car parked by road, tree, and street light",
+        "Top": "sky",
+        "Bottom": "street ",
     }
     
     # ============== IP-ADAPTER CONFIGURATION ==============
     # Enable/disable IP-Adapter
-    USE_IP_ADAPTER = False 
+    USE_IP_ADAPTER = True 
     
     # IP-Adapter model settings
     IP_ADAPTER_REPO = "h94/IP-Adapter"
     IP_ADAPTER_SUBFOLDER = "models"
-    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin"
-    IP_ADAPTER_SCALE = 0.99  # Weight for IP-Adapter influence (0.0 - 1.0)
+    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
+    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
     
     # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
     # Set to None to use conditioning image as reference
     FACE_REF_IMAGES = {
         "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/UIEB/raw-90/242_img_.png",
-        "Left": "/home/dell/Datasets/UIEB/raw-90/243_img_.png",
-        "Right": "/home/dell/Datasets/UIEB/raw-90/244_img_.png",
-        "Top": "/home/dell/Datasets/UIEB/raw-90/245_img_.png",
-        "Bottom": "/home/dell/Datasets/UIEB/raw-90/246_img_.png",
+        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
+        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
+        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
+        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
+        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
     }
     
     # Alternative: Use a single image for all faces (global style)
@@ -248,15 +248,19 @@ if __name__ == "__main__":
     image = Image.open(IMAGE_FILENAME).convert("RGB")
     conditioning_image = transform(image)
     
-    # Prepare prompts
-    prompt_list = [
-        PROMPTS.get("Front", ""),
-        PROMPTS.get("Back", ""),
-        PROMPTS.get("Left", ""),
-        PROMPTS.get("Right", ""),
-        PROMPTS.get("Top", ""),
-        PROMPTS.get("Bottom", ""),
-    ]
+    # Prepare prompts - handle both dict and string formats
+    if isinstance(PROMPTS, dict):
+        prompt_list = [
+            PROMPTS.get("Front", ""),
+            PROMPTS.get("Back", ""),
+            PROMPTS.get("Left", ""),
+            PROMPTS.get("Right", ""),
+            PROMPTS.get("Top", ""),
+            PROMPTS.get("Bottom", ""),
+        ]
+    else:
+        # Single string prompt for all faces
+        prompt_list = [PROMPTS] * 6
     
     # Generate 6 faces
     output = cubediff_pipe(

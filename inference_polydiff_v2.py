@@ -38,8 +38,8 @@ def faces_to_erp(faces, erp_height=1024, erp_width=2048):
 
 
 def create_inpaint_fn(device="cuda", 
-                      prompt="seamless transition, continuous structure, unified texture, high quality,4K",
-                      negative_prompt="visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
+                      prompt="smooth blending, natural continuation, matching colors and textures, coherent scene, photorealistic",
+                      negative_prompt="abrupt change, color mismatch, inconsistent lighting, blurry, artificial, seam line, hard edge",
                       num_inference_steps=20, 
                       strength=0.55):
     """Create SD Inpainting function for seam repair."""
@@ -86,20 +86,21 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030002_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Underwater360/cubemap/360underwater4_2_front.png"
     
     # Prompts for each direction
-    PROMPTS = {
-        "Front": "Person walks on cobblestone street",
-        "Right": "Statue stands before building",
-        "Back": "Statues stand before buildings across left and right rear views",
-        "Left": "Statue stands before buildings",
-        "Top": "sky with sun",
-        "Bottom": "street with sidewalk and road",
-    }
+    # PROMPTS = {
+    #     "Front": "Person walks on cobblestone street",
+    #     "Right": "Statue stands before building",
+    #     "Back": "Statues stand before buildings across left and right rear views",
+    #     "Left": "Statue stands before buildings",
+    #     "Top": "sky with sun",
+    #     "Bottom": "street with sidewalk and road",
+    # }
+    PROMPTS = ""
     
     # Model checkpoint (CubeDiff)
-    CHECKPOINT = "./models/cubediff-512-multitxt"
+    CHECKPOINT = "./models/cubediff-512-imgonly"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
@@ -145,15 +146,19 @@ if __name__ == "__main__":
     image = Image.open(IMAGE_FILENAME).convert("RGB")
     conditioning_image = transform(image)
     
-    # Prepare prompts
-    prompt_list = [
-        PROMPTS.get("Front", ""),
-        PROMPTS.get("Back", ""),
-        PROMPTS.get("Left", ""),
-        PROMPTS.get("Right", ""),
-        PROMPTS.get("Top", ""),
-        PROMPTS.get("Bottom", ""),
-    ]
+    # Prepare prompts - handle both dict and string formats
+    if isinstance(PROMPTS, dict):
+        prompt_list = [
+            PROMPTS.get("Front", ""),
+            PROMPTS.get("Back", ""),
+            PROMPTS.get("Left", ""),
+            PROMPTS.get("Right", ""),
+            PROMPTS.get("Top", ""),
+            PROMPTS.get("Bottom", ""),
+        ]
+    else:
+        # Single string prompt for all faces
+        prompt_list = [PROMPTS] * 6
     
     # Generate 6 faces
     output = cubediff_pipe(

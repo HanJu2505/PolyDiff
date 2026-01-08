@@ -43,8 +43,8 @@ def faces_to_erp(faces, erp_height=1024, erp_width=2048):
 
 
 def create_inpaint_fn(device="cuda", 
-                      prompt="seamless transition, continuous structure, unified texture, high quality, 4K",
-                      negative_prompt="visible seam, dividing line, border, edge, frame, split, gap, distortion, artifacts",
+                      prompt="smooth blending, natural continuation, matching colors and textures, coherent scene, photorealistic",
+                      negative_prompt="abrupt change, color mismatch, inconsistent lighting, blurry, artificial, seam line, hard edge",
                       num_inference_steps=20, 
                       strength=0.55):
     """Create SD Inpainting function for seam repair."""
@@ -102,6 +102,7 @@ if __name__ == "__main__":
         "Top": "sky",
         "Bottom": "street ",
     }
+    # PROMPTS = ""
     
     # ============== IP-ADAPTER CONFIGURATION ==============
     # Enable/disable IP-Adapter
@@ -110,8 +111,8 @@ if __name__ == "__main__":
     # IP-Adapter model settings
     IP_ADAPTER_REPO = "h94/IP-Adapter"
     IP_ADAPTER_SUBFOLDER = "models"
-    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin"
-    IP_ADAPTER_SCALE = 0.50  # Weight for IP-Adapter influence (0.0 - 1.0)
+    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
+    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
     
     # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
     # Set to None to disable IP-Adapter for specific faces
@@ -147,7 +148,7 @@ if __name__ == "__main__":
     
     # Seam repair parameters (edge-by-edge)
     SEAM_WIDTH = 50      # Width of seam region
-    FEATHER = 20          # Feather width for blending
+    FEATHER = 30          # Feather width for blending
     INPAINT_STEPS = 20    # Inpainting steps per edge
     INPAINT_STRENGTH = 0.55
     DEBUG_SEAMS = True    # Save debug images for each edge
@@ -178,7 +179,8 @@ if __name__ == "__main__":
         cubediff_pipe.load_ip_adapter(
             IP_ADAPTER_REPO, 
             subfolder=IP_ADAPTER_SUBFOLDER, 
-            weight_name=IP_ADAPTER_WEIGHT_NAME
+            weight_name=IP_ADAPTER_WEIGHT_NAME,
+            local_files_only=True  # Use cached model to avoid network issues
         )
         cubediff_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
         print(f"[INFO] IP-Adapter loaded with scale={IP_ADAPTER_SCALE}")
@@ -221,15 +223,19 @@ if __name__ == "__main__":
     image = Image.open(IMAGE_FILENAME).convert("RGB")
     conditioning_image = transform(image)
     
-    # Prepare prompts
-    prompt_list = [
-        PROMPTS.get("Front", ""),
-        PROMPTS.get("Back", ""),
-        PROMPTS.get("Left", ""),
-        PROMPTS.get("Right", ""),
-        PROMPTS.get("Top", ""),
-        PROMPTS.get("Bottom", ""),
-    ]
+    # Prepare prompts - handle both dict and string formats
+    if isinstance(PROMPTS, dict):
+        prompt_list = [
+            PROMPTS.get("Front", ""),
+            PROMPTS.get("Back", ""),
+            PROMPTS.get("Left", ""),
+            PROMPTS.get("Right", ""),
+            PROMPTS.get("Top", ""),
+            PROMPTS.get("Bottom", ""),
+        ]
+    else:
+        # Single string prompt for all faces
+        prompt_list = [PROMPTS] * 6
     
     # Generate 6 faces
     output = cubediff_pipe(
