@@ -113,13 +113,16 @@ class CubeDiffPipeline(StableDiffusionPipeline):
                     # Determine num_tokens and scale from old processor
                     num_tokens = getattr(old_processor, 'num_tokens', 4)
                     scale = getattr(old_processor, 'scale', 1.0)
+                    # diffusers 使用列表支持多个 IP-Adapter，我们只用第一个
+                    if isinstance(scale, (list, tuple)):
+                        scale = scale[0] if len(scale) > 0 else 1.0
                     
                     # Create our custom processor
                     new_processor = CubeDiffIPAdapterAttnProcessor(
                         hidden_size=hidden_size,
                         cross_attention_dim=cross_attention_dim,
                         num_tokens=num_tokens,
-                        scale=scale,
+                        scale=float(scale),  # 确保是 float
                     )
                     
                     # Migrate weights (to_k_ip and to_v_ip are nn.ModuleList in diffusers)

@@ -1,0 +1,62 @@
+# Configuration for training with pre-extracted cubemaps + IP-Adapter
+# Disable Hydra's default logging if desired
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+# Config name
+name: "polydiff-multitext-ipadapter"
+
+# Training parameters
+training:
+  seed: 42
+  epochs: 20
+  batch_size: 16        # Global batch size - 增大以提高稳定性
+  per_gpu_batch_size: 1 # Per GPU batch size
+  learning_rate: 1e-4   # 提高学习率加快收敛
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  warmup_steps: 100     # 预热步数（总步数约750，warmup占13%）
+  num_workers: 4
+  num_gpus: 1
+  use_checkpointing: true # 开启梯度检查点节省显存 ⭐
+  mixed_precision: "fp16"
+  checkpoint_interval_type: "steps"
+  checkpoint_interval: 100  # 测试时更频繁保存
+  validation_interval: 50   # 测试时更频繁验证
+  prediction_type: "epsilon"
+  type: "multitext"
+  resume_checkpoint: false
+  resume_checkpoint_filename: ""
+  
+  # New: Pre-extracted cubemap settings
+  use_preextracted: true
+  augment: true  # Enable discrete face rotation augmentation
+  
+  # New: IP-Adapter settings
+  use_ip_adapter: true
+  ip_adapter_repo: "h94/IP-Adapter"
+  ip_adapter_subfolder: "models"
+  ip_adapter_weight_name: "ip-adapter_sd15.bin"
+
+# Model & Data parameters
+model:
+  id: "runwayml/stable-diffusion-v1-5"  # 使用您已缓存的模型
+  image_size: 512
+
+# Directories
+directories:
+  checkpoint_dir: "./checkpoints/polydiff-multitext-ipadapter"
+  cache_dir: "~/.cache/huggingface/hub"  # 使用 HuggingFace 默认缓存目录
+  
+  # Pre-extracted cubemap data directories
+  cubemap_dir: "/home/dell/Datasets/PolyDiff/TrainCubeMaps"
+  prompt_dir: "/home/dell/Datasets/PolyDiff/TrainPrompts"
+  
+  # Original ERP data directory (not used when use_preextracted=true)
+  data_dir: "/home/dell/Datasets/PolyDiff/TrainERP"
+
+# SwanLab (国内实验追踪平台)
+swanlab:
+  project_name: "polydiff-training"
+  use_cloud: true  # false=本地模式, true=云端同步

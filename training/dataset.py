@@ -281,3 +281,163 @@ def cubemap_collate_fn(batch):
     single_captions = [item[4] for item in batch]
 
     return cubemaps, prompts, filenames, equirecs, single_captions
+
+
+def rotate_faces_discrete(faces, prompts, step):
+    """
+    Discrete rotation of horizontal faces (front, back, left, right).
+    Top and bottom remain unchanged.
+    
+    Args:
+        faces: List of 6 face images [front, back, left, right, top, bottom]
+        prompts: List of 6 prompts [front, back, left, right, top, bottom]
+        step: Rotation step (0=0°, 1=+90°, 2=180°, 3=-90°)
+    
+    Returns:
+        Rotated faces and prompts
+    """
+    front, back, left, right, top, bottom = faces
+    p_front, p_back, p_left, p_right, p_top, p_bottom = prompts
+    
+    if step == 0:  # No rotation
+        new_faces = [front, back, left, right, top, bottom]
+        new_prompts = [p_front, p_back, p_left, p_right, p_top, p_bottom]
+    elif step == 1:  # Right → Front (+90°)
+        new_faces = [right, left, front, back, top, bottom]
+        new_prompts = [p_right, p_left, p_front, p_back, p_top, p_bottom]
+    elif step == 2:  # Back → Front (180°)
+        new_faces = [back, front, right, left, top, bottom]
+        new_prompts = [p_back, p_front, p_right, p_left, p_top, p_bottom]
+    elif step == 3:  # Left → Front (-90°)
+        new_faces = [left, right, back, front, top, bottom]
+        new_prompts = [p_left, p_right, p_back, p_front, p_top, p_bottom]
+    else:
+        raise ValueError(f"Invalid rotation step: {step}. Must be 0, 1, 2, or 3.")
+    
+    return new_faces, new_prompts
+
+
+class PreExtractedCubemapDataset(Dataset):
+    """
+    Dataset for training with pre-extracted cubemap faces.
+    
+    Supports:
+    - Discrete face rotation augmentation (4 options)
+    - IP-Adapter reference images (same scene's faces)
+    - Prompt dropout
+    
+    Directory structure:
+        cubemap_dir/
+            {scene_id}_front.png
+            {scene_id}_back.png
+            ...
+        prompt_dir/
+            {scene_id}.json
+    """
+    
+    def __init__(self, cubemap_dir, prompt_dir, face_size=512, augment=True, return_ref_images=True):
+        """
+        Args:
+            cubemap_dir: Directory containing cubemap face images
+            prompt_dir: Directory containing prompt JSON files
+            face_size: Size of each face (default 512)
+            augment: Whether to apply discrete face rotation augmentation
+            return_ref_images: Whether to return reference images for IP-Adapter
+        """
+        self.cubemap_dir = cubemap_dir
+        self.prompt_dir = prompt_dir
+        self.face_size = face_size
+        self.augment = augment
+        self.return_ref_images = return_ref_images
+        self.face_order = ["front", "back", "left", "right", "top", "bottom"]
+        
+        # Collect all scene IDs from prompt files
+        prompt_files = [f for f in os.listdir(prompt_dir) if f.endswith('.json')]
+        self.scene_ids = sorted([f.replace('.json', '') for f in prompt_files])
+        
+        print(f"[INFO] PreExtractedCubemapDataset: Found {len(self.scene_ids)} scenes")
+        print(f"[INFO] Augmentation: {'Enabled (4x)' if augment else 'Disabled'}")
+        print(f"[INFO] IP-Adapter ref images: {'Enabled' if return_ref_images else 'Disabled'}")
+    
+    def __len__(self):
+        return len(self.scene_ids)
+    
+    def __getitem__(self, idx):
+        scene_id = self.scene_ids[idx]
+        
+        # Load 6 cubemap faces
+        faces = []
+        for face_name in self.face_order:
+            img_path = os.path.join(self.cubemap_dir, f"{scene_id}_{face_name}.png")
+            if not os.path.exists(img_path):
+                # Try jpg if png not found
+                img_path = os.path.join(self.cubemap_dir, f"{scene_id}_{face_name}.jpg")
+            
+            img = cv2.imread(img_path)
+            if img is None:
+                raise ValueError(f"Failed to load image: {img_path}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Resize if needed
+            if img.shape[0] != self.face_size or img.shape[1] != self.face_size:
+                img = cv2.resize(img, (self.face_size, self.face_size))
+            
+            faces.append(img)
+        
+        # Load prompts
+        prompt_path = os.path.join(self.prompt_dir, f"{scene_id}.json")
+        with open(prompt_path, 'r') as f:
+            prompt_data = json.load(f)
+        prompts = [prompt_data.get(face, "") for face in self.face_order]
+        
+        # Apply discrete face rotation augmentation
+        if self.augment:
+            rotation_step = np.random.randint(0, 4)  # 0, 1, 2, or 3
+            faces, prompts = rotate_faces_discrete(faces, prompts, rotation_step)
+        
+        # Convert faces to tensors and normalize to [-1, 1]
+        face_tensors = []
+        for face_img in faces:
+            face_tensor = torch.from_numpy(face_img).float() / 255.0
+            face_tensor = face_tensor * 2.0 - 1.0  # Normalize to [-1, 1]
+            face_tensor = face_tensor.permute(2, 0, 1)  # HWC -> CHW
+            face_tensors.append(face_tensor)
+        
+        cubemap_tensor = torch.stack(face_tensors, dim=0)  # [6, 3, H, W]
+        
+        # Prepare reference images for IP-Adapter (same faces, in PIL format)
+        ref_images = None
+        if self.return_ref_images:
+            from PIL import Image
+            ref_images = [Image.fromarray(face_img) for face_img in faces]
+        
+        # Single caption (use front face prompt as fallback)
+        single_caption = prompts[0] if prompts[0] else ""
+        
+        return cubemap_tensor, prompts, ref_images, scene_id, single_caption
+
+
+def preextracted_cubemap_collate_fn(batch):
+    """
+    Collate function for PreExtractedCubemapDataset.
+    
+    Returns:
+        cubemaps: [B*6, C, H, W]
+        prompts: List of B*6 strings
+        ref_images: List of B lists, each containing 6 PIL images (or None)
+        scene_ids: List of B scene IDs
+        single_captions: List of B captions
+    """
+    batch = [item for item in batch if item is not None and isinstance(item[0], torch.Tensor)]
+    
+    if len(batch) == 0:
+        return None
+    
+    cubemaps = torch.cat([item[0] for item in batch], dim=0)  # [B*6, C, H, W]
+    prompts = [prompt for item in batch for prompt in item[1]]  # Flatten prompts
+    ref_images = [item[2] for item in batch]  # List of B lists
+    scene_ids = [item[3] for item in batch]
+    single_captions = [item[4] for item in batch]
+    
+    return cubemaps, prompts, ref_images, scene_ids, single_captions
+

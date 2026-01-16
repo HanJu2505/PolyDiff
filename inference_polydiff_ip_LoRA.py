@@ -172,7 +172,7 @@ if __name__ == "__main__":
     # LoRA model settings
     LORA_PATH = "./models/UNDERWATER_SCENE_v2.safetensors"
     LORA_TRIGGER_WORD = "UNDERWATER_SCENE, deep sea, blue water"
-    LORA_SCALE = 0.9  # Strength: 0.5-0.8 recommended (too high = too blue)
+    LORA_SCALE = 0.99  # Strength: 0.5-0.8 recommended (too high = too blue)
     
     # =================================================
     
