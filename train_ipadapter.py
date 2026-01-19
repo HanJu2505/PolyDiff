@@ -527,8 +527,10 @@ def main(cfg: DictConfig):
                             pipe.unet = unwrap_model(unet)
                             pipe.unet.eval()
                             
+                            # 确保 UNet 在正确的 dtype（与训练时一致）
+                            pipe.unet.to(dtype=weight_dtype)
+                            
                             # 使用预加载的固定验证样本（无增强）
-                            # 重要：需要转换为正确的数据类型（fp16），否则会出现类型不匹配错误
                             val_conditioning_image = val_conditioning_image_fixed.to(accelerator.device, dtype=weight_dtype)
                             val_prompts = val_prompts_fixed
                             
@@ -540,8 +542,8 @@ def main(cfg: DictConfig):
                                 val_prompts_for_gen = val_prompts
                             
                             try:
-                                # Generate sample
-                                with torch.no_grad():
+                                # Generate sample with autocast for fp16 consistency
+                                with torch.no_grad(), torch.cuda.amp.autocast(dtype=weight_dtype):
                                     pipeline_output = pipe(
                                         prompts=val_prompts_for_gen,
                                         conditioning_image=val_conditioning_image,
