@@ -1,12 +1,16 @@
 """
-PolyDiff Inference Script (2-Stage Pipeline)
+PolyDiff Inference Script with IP-Adapter (ERP-level Seam Repair)
 
 Generate 360° panoramas using:
-  Stage 1: Generate 6 main cubemap faces using CubeDiff
+  Stage 1: Generate 6 main cubemap faces using CubeDiff + IP-Adapter
   Stage 2: Repair seams using ERP-level SD Inpainting
 
+Features:
+  - Per-face IP-Adapter reference images
+  - ERP-level seam repair (faster than edge-by-edge)
+
 Usage:
-    python inference_polydiff.py
+    python inference_polydiff_ip.py
 """
 
 import torch
@@ -18,6 +22,7 @@ import py360convert
 
 # Use original CubeDiff pipeline for 6-view generation
 from cubediff.pipelines.pipeline import CubeDiffPipeline
+from diffusers.utils import load_image
 
 # 6 main view names
 FACE_NAMES = ["front", "back", "left", "right", "top", "bottom"]
@@ -124,7 +129,7 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_views/030003_front_up.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
     
     # Prompts for each direction
     PROMPTS = {
@@ -133,15 +138,50 @@ if __name__ == "__main__":
         "Back": "Cars parked along road with trees and sidewalk",
         "Left": "Car parked by road, tree, and street light",
         "Top": "sky",
-        "Bottom": "street",
+        "Bottom": "street ",
     }
+    
+    # ============== IP-ADAPTER CONFIGURATION ==============
+    # Enable/disable IP-Adapter
+    USE_IP_ADAPTER = True 
+    
+    # IP-Adapter model settings
+    IP_ADAPTER_REPO = "h94/IP-Adapter"
+    IP_ADAPTER_SUBFOLDER = "models"
+    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
+    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
+    
+    # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
+    # Set to None to use conditioning image as reference
+    FACE_REF_IMAGES = {
+        "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
+        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
+        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
+        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
+        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
+        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
+    }
+    
+    # Alternative: Use a single image for all faces (global style)
+    GLOBAL_REF_IMAGE = None
+    
+    # ============== LORA CONFIGURATION ==============
+    # Enable/disable LoRA
+    USE_LORA = True
+    
+    # LoRA model settings
+    LORA_PATH = "./models/UNDERWATER_SCENE_v2.safetensors"
+    LORA_TRIGGER_WORD = "UNDERWATER_SCENE, deep sea, blue water"
+    LORA_SCALE = 0.99  # Strength: 0.5-0.8 recommended (too high = too blue)
+    
+    # =================================================
     
     # Model checkpoint (CubeDiff)
     CHECKPOINT = "./models/cubediff-512-multitxt"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
-    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff/"
+    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_ip_LoRA/"
     
     # Generation parameters
     CFG_SCALE = 3.5
@@ -163,11 +203,77 @@ if __name__ == "__main__":
     # =================== STAGE 1: Generate 6 Faces ===================
     print("\n" + "="*60)
     print("[Stage 1] Generating 6 cubemap faces with CubeDiff...")
+    if USE_IP_ADAPTER:
+        print("         IP-Adapter: ENABLED")
     print("="*60)
     
     # Load CubeDiff pipeline
     print(f"[INFO] Loading CubeDiff Pipeline from {CHECKPOINT}...")
     cubediff_pipe = CubeDiffPipeline.from_pretrained(CHECKPOINT).to(device)
+    
+    # ================= Load Underwater LoRA =================
+    if USE_LORA:
+        if os.path.exists(LORA_PATH):
+            print(f"\n[INFO] Loading Underwater LoRA from: {LORA_PATH}")
+            try:
+                # 1. Load LoRA weights
+                cubediff_pipe.load_lora_weights(LORA_PATH, adapter_name="underwater")
+                
+                # 2. Fuse LoRA into UNet (critical for PolyDiff's Attention compatibility)
+                cubediff_pipe.fuse_lora(lora_scale=LORA_SCALE)
+                print(f"[INFO] LoRA fused successfully with scale {LORA_SCALE}")
+                
+                # 3. Append trigger words to prompts
+                print(f"[INFO] Appending trigger words: '{LORA_TRIGGER_WORD}'")
+                if isinstance(PROMPTS, dict):
+                    for face_key in PROMPTS:
+                        PROMPTS[face_key] = f"{PROMPTS[face_key]}, {LORA_TRIGGER_WORD}"
+                elif isinstance(PROMPTS, str):
+                    PROMPTS = f"{PROMPTS}, {LORA_TRIGGER_WORD}"
+                    
+            except Exception as e:
+                print(f"[WARNING] Failed to load LoRA: {e}")
+                print("Continuing without LoRA...")
+        else:
+            print(f"[WARNING] LoRA file not found at {LORA_PATH}")
+            print("Please download 'underwater_v1.safetensors' to the models folder.")
+    # =========================================================
+    
+    # Load IP-Adapter if enabled
+    ip_adapter_images = None
+    if USE_IP_ADAPTER:
+        print(f"[INFO] Loading IP-Adapter from {IP_ADAPTER_REPO}...")
+        cubediff_pipe.load_ip_adapter(
+            IP_ADAPTER_REPO, 
+            subfolder=IP_ADAPTER_SUBFOLDER, 
+            weight_name=IP_ADAPTER_WEIGHT_NAME
+        )
+        cubediff_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+        print(f"[INFO] IP-Adapter loaded with scale={IP_ADAPTER_SCALE}")
+        
+        # Prepare reference images
+        conditioning_pil = Image.open(IMAGE_FILENAME).convert("RGB")
+        
+        if GLOBAL_REF_IMAGE is not None:
+            print(f"[INFO] Using global reference image: {GLOBAL_REF_IMAGE}")
+            ip_adapter_images = load_image(GLOBAL_REF_IMAGE)
+        else:
+            # Collect per-face reference images
+            ref_images_list = []
+            face_order = ["Front", "Back", "Left", "Right", "Top", "Bottom"]
+            
+            print("[INFO] Preparing per-face IP-Adapter references...")
+            for face_name in face_order:
+                ref_path = FACE_REF_IMAGES.get(face_name)
+                if ref_path is not None and os.path.exists(ref_path):
+                    print(f"  - {face_name}: {ref_path}")
+                    ref_images_list.append(load_image(ref_path))
+                else:
+                    # Use conditioning image as default reference
+                    print(f"  - {face_name}: using conditioning image (default)")
+                    ref_images_list.append(conditioning_pil)
+            
+            ip_adapter_images = ref_images_list
     
     # Load conditioning image
     print(f"[INFO] Loading conditioning image {IMAGE_FILENAME}...")
@@ -197,6 +303,7 @@ if __name__ == "__main__":
     output = cubediff_pipe(
         prompts=prompt_list,
         conditioning_image=conditioning_image.unsqueeze(0).to(device),
+        ip_adapter_image=[ip_adapter_images] if ip_adapter_images is not None else None,
         num_inference_steps=NUM_INFERENCE_STEPS,
         cfg_scale=CFG_SCALE,
     )
@@ -221,9 +328,9 @@ if __name__ == "__main__":
     del cubediff_pipe
     torch.cuda.empty_cache()
     
-    # =================== STAGE 2: Seam Repair ===================
+    # =================== STAGE 2: Seam Repair (ERP-level) ===================
     print("\n" + "="*60)
-    print("[Stage 2] Repairing seams with SD Inpainting...")
+    print("[Stage 2] Repairing seams with ERP-level SD Inpainting...")
     print("="*60)
     
     # Create edge masks
@@ -260,4 +367,6 @@ if __name__ == "__main__":
     print("  - erp_before.png: Before seam repair")
     print("  - erp_after.png: After seam repair")
     print("  - equirectangular.png: Final output")
+    if USE_IP_ADAPTER:
+        print(f"  - IP-Adapter scale: {IP_ADAPTER_SCALE}")
     print("="*60)

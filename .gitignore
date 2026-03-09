@@ -1,6 +1,7 @@
 # Data
 /data/
 output/
+checkpoints/
 # pretrained models
 /models/
 # Mac OS-specific storage files

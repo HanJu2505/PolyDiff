@@ -1,12 +1,16 @@
 """
-PolyDiff Inference Script (2-Stage Pipeline with Edge-by-Edge Seam Repair)
+PolyDiff Inference Script with IP-Adapter Support
 
 Generate 360° panoramas using:
-  Stage 1: Generate 6 main cubemap faces using CubeDiff
+  Stage 1: Generate 6 main cubemap faces using CubeDiff + IP-Adapter
   Stage 2: Repair 12 seams individually using SD Inpainting
 
+Features:
+  - Per-face IP-Adapter reference images (each face can have its own style)
+  - Edge-by-edge seam repair
+
 Usage:
-    python inference_polydiff_v2.py 
+    python inference_polydiff_ip.py
 """
 
 import torch
@@ -22,6 +26,7 @@ from cubediff.pipelines.seam_repair import repair_all_seams, FACE_NAMES
 
 # For SD Inpainting
 from diffusers import StableDiffusionInpaintPipeline
+from diffusers.utils import load_image
 
 
 def faces_to_erp(faces, erp_height=1024, erp_width=2048):
@@ -86,25 +91,54 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Underwater360/cubemap/360underwater4_2_front.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
     
     # Prompts for each direction
-    # PROMPTS = {
-    #     "Front": "Person walks on cobblestone street",
-    #     "Right": "Statue stands before building",
-    #     "Back": "Statues stand before buildings across left and right rear views",
-    #     "Left": "Statue stands before buildings",
-    #     "Top": "sky with sun",
-    #     "Bottom": "street with sidewalk and road",
-    # }
-    PROMPTS = ""
+    PROMPTS = {
+        "Front": "Church stands between two buildings",
+        "Right": "Car parked by road, sidewalk, and trees",
+        "Back": "Cars parked along road with trees and sidewalk",
+        "Left": "Car parked by road, tree, and street light",
+        "Top": "sky",
+        "Bottom": "street ",
+    }
+    # PROMPTS = ""
+    
+    # ============== IP-ADAPTER CONFIGURATION ==============
+    # Enable/disable IP-Adapter
+    USE_IP_ADAPTER = True
+    
+    # IP-Adapter model settings
+    IP_ADAPTER_REPO = "h94/IP-Adapter"
+    IP_ADAPTER_SUBFOLDER = "models"
+    IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
+    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
+    
+    # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
+    # Set to None to disable IP-Adapter for specific faces
+    # Or use the same image path for all faces for global style transfer
+    FACE_REF_IMAGES = {
+        "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
+        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
+        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
+        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
+        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
+        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
+    }
+    
+    # Alternative: Use a single image for all faces (global style)
+    # Uncomment below to use global reference image
+    # GLOBAL_REF_IMAGE = "assets/reference_style.jpg"
+    GLOBAL_REF_IMAGE = None
+    
+    # =================================================
     
     # Model checkpoint (CubeDiff)
-    CHECKPOINT = "./models/cubediff-512-imgonly"
+    CHECKPOINT = "./models/cubediff-512-multitxt"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
-    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_v2/"
+    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_v2_ip/"
     
     # Generation parameters
     CFG_SCALE = 3.5
@@ -114,7 +148,7 @@ if __name__ == "__main__":
     
     # Seam repair parameters (edge-by-edge)
     SEAM_WIDTH = 50      # Width of seam region
-    FEATHER = 20          # Feather width for blending
+    FEATHER = 30          # Feather width for blending
     INPAINT_STEPS = 20    # Inpainting steps per edge
     INPAINT_STRENGTH = 0.55
     DEBUG_SEAMS = True    # Save debug images for each edge
@@ -130,11 +164,54 @@ if __name__ == "__main__":
     # =================== STAGE 1: Generate 6 Faces ===================
     print("\n" + "="*60)
     print("[Stage 1] Generating 6 cubemap faces with CubeDiff...")
+    if USE_IP_ADAPTER:
+        print("         IP-Adapter: ENABLED")
     print("="*60)
     
     # Load CubeDiff pipeline
     print(f"[INFO] Loading CubeDiff Pipeline from {CHECKPOINT}...")
     cubediff_pipe = CubeDiffPipeline.from_pretrained(CHECKPOINT).to(device)
+    
+    # Load IP-Adapter if enabled
+    ip_adapter_images = None
+    if USE_IP_ADAPTER:
+        print(f"[INFO] Loading IP-Adapter from {IP_ADAPTER_REPO}...")
+        cubediff_pipe.load_ip_adapter(
+            IP_ADAPTER_REPO, 
+            subfolder=IP_ADAPTER_SUBFOLDER, 
+            weight_name=IP_ADAPTER_WEIGHT_NAME,
+            local_files_only=True  # Use cached model to avoid network issues
+        )
+        cubediff_pipe.set_ip_adapter_scale(IP_ADAPTER_SCALE)
+        print(f"[INFO] IP-Adapter loaded with scale={IP_ADAPTER_SCALE}")
+        
+        # Prepare reference images
+        # Load conditioning image first (will be used as default for None entries)
+        conditioning_pil = Image.open(IMAGE_FILENAME).convert("RGB")
+        
+        if GLOBAL_REF_IMAGE is not None:
+            # Use single image for all faces
+            print(f"[INFO] Using global reference image: {GLOBAL_REF_IMAGE}")
+            ip_adapter_images = load_image(GLOBAL_REF_IMAGE)
+        else:
+            # Collect per-face reference images
+            # When None, use the conditioning image as reference
+            ref_images_list = []
+            face_order = ["Front", "Back", "Left", "Right", "Top", "Bottom"]
+            
+            print("[INFO] Preparing per-face IP-Adapter references...")
+            for face_name in face_order:
+                ref_path = FACE_REF_IMAGES.get(face_name)
+                if ref_path is not None and os.path.exists(ref_path):
+                    print(f"  - {face_name}: {ref_path}")
+                    ref_images_list.append(load_image(ref_path))
+                else:
+                    # Use conditioning image as default reference
+                    print(f"  - {face_name}: using conditioning image (default)")
+                    ref_images_list.append(conditioning_pil)
+            
+            # All 6 faces now have reference images
+            ip_adapter_images = ref_images_list
     
     # Load conditioning image
     print(f"[INFO] Loading conditioning image {IMAGE_FILENAME}...")
@@ -164,6 +241,9 @@ if __name__ == "__main__":
     output = cubediff_pipe(
         prompts=prompt_list,
         conditioning_image=conditioning_image.unsqueeze(0).to(device),
+        # 关键修改：用中括号 [] 把 ip_adapter_images 包起来
+        # 外层列表长度=1 对应 1个IP-Adapter，内层列表长度=6 对应 Batch Size=6
+        ip_adapter_image=[ip_adapter_images] if ip_adapter_images is not None else None,
         num_inference_steps=NUM_INFERENCE_STEPS,
         cfg_scale=CFG_SCALE,
     )
@@ -233,6 +313,8 @@ if __name__ == "__main__":
     print("  - erp_before.png: Before seam repair")
     print("  - erp_after.png: After seam repair (12 edges)")
     print("  - equirectangular.png: Final output")
+    if USE_IP_ADAPTER:
+        print(f"  - IP-Adapter scale: {IP_ADAPTER_SCALE}")
     if DEBUG_SEAMS:
         print(f"  - debug/: Debug images for each edge")
     print("="*60)
