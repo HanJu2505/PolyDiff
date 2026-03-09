@@ -11,7 +11,7 @@ name: "polydiff-multitext-ipadapter"
 training:
   seed: 42
   epochs: 20
-  batch_size: 16        # Global batch size - 增大以提高稳定性
+  batch_size: 32        # Global batch size - 增大以提高稳定性
   per_gpu_batch_size: 1 # Per GPU batch size
   learning_rate: 1e-4   # 提高学习率加快收敛
   betas: [0.9, 0.999]
@@ -41,12 +41,12 @@ training:
 
 # Model & Data parameters
 model:
-  id: "runwayml/stable-diffusion-v1-5"  # 使用您已缓存的模型
+  id: "runwayml/stable-diffusion-v1-5"  # 高质量写实模型 "runwayml/stable-diffusion-v1-5"  SG161222/Realistic_Vision_V5.1_noVAE
   image_size: 512
 
 # Directories
 directories:
-  checkpoint_dir: "./checkpoints/polydiff-multitext-ipadapter"
+  checkpoint_dir: "./checkpoints/polydiff-minimal" # polydiff-multitext-ipadapter polydiff-minimal
   cache_dir: "~/.cache/huggingface/hub"  # 使用 HuggingFace 默认缓存目录
   
   # Pre-extracted cubemap data directories

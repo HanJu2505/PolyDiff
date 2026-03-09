@@ -1,0 +1,54 @@
+# Configuration for conv_out only training
+# Uses original SD1.5 (4-channel input, no position encoding or mask)
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+# Config name
+name: "sd15-convout-only"
+
+# Training parameters
+training:
+  seed: 42
+  epochs: 20
+  batch_size: 32
+  per_gpu_batch_size: 1
+  learning_rate: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  warmup_steps: 100
+  num_workers: 4
+  num_gpus: 1
+  use_checkpointing: true
+  mixed_precision: "fp16"
+  checkpoint_interval: 100
+  prediction_type: "epsilon"
+  
+  # Pre-extracted cubemap settings
+  use_preextracted: true
+  augment: true
+  
+  # IP-Adapter settings
+  use_ip_adapter: true
+  ip_adapter_repo: "h94/IP-Adapter"
+  ip_adapter_subfolder: "models"
+  ip_adapter_weight_name: "ip-adapter_sd15.bin"
+
+# Model & Data parameters
+model:
+  id: "runwayml/stable-diffusion-v1-5"  # 原始 SD1.5
+  image_size: 512
+
+# Directories
+directories:
+  checkpoint_dir: "./checkpoints/sd15-convout"
+  cache_dir: "~/.cache/huggingface/hub"
+  
+  # Pre-extracted cubemap data directories
+  cubemap_dir: "/home/dell/Datasets/PolyDiff/TrainCubeMaps"
+  prompt_dir: "/home/dell/Datasets/PolyDiff/TrainPrompts"
+
+# SwanLab
+swanlab:
+  project_name: "polydiff-training"
+  use_cloud: true

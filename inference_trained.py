@@ -125,7 +125,7 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # 训练好的检查点路径
-    TRAINED_CHECKPOINT = "./checkpoints/polydiff-multitext-ipadapter/polydiff-multitext-ipadapter/epoch_20_step_200_final"
+    TRAINED_CHECKPOINT = "./checkpoints/sd15-convout/sd15-convout-only/epoch_20_step_220_final"
     
     # 是否加载训练权重 (设为 False 可对比原始模型效果)
     LOAD_TRAINED_WEIGHTS = True
@@ -134,16 +134,16 @@ if __name__ == "__main__":
     BASE_MODEL = "./models/cubediff-512-multitxt"
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/UIEB/raw-90/268_img_.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_front.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Fish swim near jellyfish and aquatic plants; cuttlefish is below.",
-        "Right": "Fish swim in water; sea floor below.",
-        "Back": "Fish are in water surrounded by aquatic plants.",
-        "Left": "Diver is near reef; fish surround the area.",
-        "Top": "Ocean surface ",
-        "Bottom": "Ocean floor ",
+        "Front": "underwater",
+        "Right": "underwater",
+        "Back": "underwater",
+        "Left": "underwater",
+        "Top": "underwater",
+        "Bottom": "underwater",
     }
     
     # ============== IP-ADAPTER CONFIGURATION ==============
@@ -156,12 +156,12 @@ if __name__ == "__main__":
     
     # Per-face reference images
     FACE_REF_IMAGES = {
-        "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/UIIS/UDW/extracted_objects/fish/XL_1176_ann697_0011.png",
-        "Left": "/home/dell/Datasets/UIIS/UDW/extracted_objects/fish/XL_1176_ann697_0011.png",
-        "Right": "/home/dell/Datasets/UIIS/UDW/extracted_objects/fish/XL_1176_ann697_0011.png",
-        "Top": "/home/dell/Datasets/UIIS/UDW/extracted_objects/fish/XL_1176_ann697_0011.png",
-        "Bottom": "/home/dell/Datasets/UIIS/UDW/extracted_objects/fish/XL_1176_ann697_0011.png",
+        "Front": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_front.png",  # Use None to skip, or provide path like "assets/ref_front.jpg"
+        "Back": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_back.png",
+        "Left": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_left.png",
+        "Right": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_right.png",
+        "Top": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_top.png",
+        "Bottom": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_bottom.png",
     }
     
     GLOBAL_REF_IMAGE = None
@@ -174,7 +174,7 @@ if __name__ == "__main__":
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
-    OUTPUT_DIR = f"output/{IMAGE_NAME}_trained/"
+    OUTPUT_DIR = f"output/{IMAGE_NAME}_convout/"
     
     # Generation parameters
     CFG_SCALE = 3.5

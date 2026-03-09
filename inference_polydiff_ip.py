@@ -129,16 +129,16 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_front.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Church stands between two buildings",
-        "Right": "Car parked by road, sidewalk, and trees",
-        "Back": "Cars parked along road with trees and sidewalk",
-        "Left": "Car parked by road, tree, and street light",
-        "Top": "sky",
-        "Bottom": "street ",
+        "Front": "underwater",
+        "Right": "underwater",
+        "Back": "underwater",
+        "Left": "underwater",
+        "Top": "underwater",
+        "Bottom": "underwater",
     }
     
     # ============== IP-ADAPTER CONFIGURATION ==============
@@ -149,17 +149,17 @@ if __name__ == "__main__":
     IP_ADAPTER_REPO = "h94/IP-Adapter"
     IP_ADAPTER_SUBFOLDER = "models"
     IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
-    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
+    IP_ADAPTER_SCALE = 0.99  # Weight for IP-Adapter influence (0.0 - 1.0)
     
     # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
     # Set to None to use conditioning image as reference
     FACE_REF_IMAGES = {
-        "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
-        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
-        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
-        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
-        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
+        "Front": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_front.png",  # Use None to skip, or provide path like "assets/ref_front.jpg"
+        "Back": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_back.png",
+        "Left": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_left.png",
+        "Right": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_right.png",
+        "Top": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_top.png",
+        "Bottom": "/home/dell/Datasets/Underwater360/cubemap/360underwater2_3_bottom.png",
     }
     
     # Alternative: Use a single image for all faces (global style)

@@ -1,13 +1,13 @@
 """
-CubeDiff Training Script with IP-Adapter Support
+CubeDiff Minimal Fine-tuning Training Script
 
-This script supports training with:
-- Pre-extracted cubemap faces (no ERP conversion at runtime)
-- Discrete face rotation augmentation
-- IP-Adapter conditioning (frozen, not fine-tuned)
+This script uses a minimal fine-tuning strategy:
+- Only trains: conv_in, first down_block, and last up_block
+- Much fewer trainable parameters (~10x less than full fine-tuning)
+- Reduces overfitting risk while still adapting to new data
 
 Usage:
-    python train_ipadapter.py --config multitext_ipadapter
+    python train_minimal.py --config multitext_ipadapter
 """
 
 import os
@@ -136,6 +136,11 @@ def main(cfg: DictConfig):
             print("[INFO] IP-Adapter loaded successfully")
 
     # ---------------------- Freeze and Unfreeze Parameters ----------------------
+    # 策略：只微调最少的层，减少过拟合风险
+    # - conv_in: 输入层（适配 7 通道输入）
+    # - down_blocks[0]: 第一个下采样块
+    # - up_blocks[-1]: 最后一个上采样块
+    
     for param in pipe.vae.parameters():
         param.requires_grad = False
 
@@ -145,16 +150,22 @@ def main(cfg: DictConfig):
     for param in pipe.text_encoder.parameters():
         param.requires_grad = False
     
-    # Unfreeze conv_in
-    for name, param in pipe.unet.conv_in.named_parameters():
+    # 1. Unfreeze conv_in (输入层)
+    for param in pipe.unet.conv_in.parameters():
         param.requires_grad = True
-
-    # Unfreeze attention layers (but NOT IP-Adapter layers)
+    
+    # 2. Unfreeze down_blocks[0] (第一个下采样块)
+    for param in pipe.unet.down_blocks[0].parameters():
+        param.requires_grad = True
+        
+    # 3. Unfreeze up_blocks[-1] (最后一个上采样块)
+    for param in pipe.unet.up_blocks[-1].parameters():
+        param.requires_grad = True
+    
+    # 但保持 IP-Adapter 的 to_k_ip 和 to_v_ip 冻结（如果存在）
     for name, param in pipe.unet.named_parameters():
-        if "attn" in name:
-            # Keep IP-Adapter projection layers frozen
-            if "to_k_ip" not in name and "to_v_ip" not in name:
-                param.requires_grad = True
+        if "to_k_ip" in name or "to_v_ip" in name:
+            param.requires_grad = False
     
     # ---------------------- Dataset and DataLoader ----------------------
     use_preextracted = getattr(cfg.training, 'use_preextracted', False)
