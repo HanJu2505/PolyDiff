@@ -1,4 +1,5 @@
 import torch
+import math
 from typing import Optional, Dict, Any
 from einops import rearrange
 from diffusers.models.attention import BasicTransformerBlock
@@ -6,10 +7,79 @@ from diffusers.models.attention import Attention
 from diffusers.utils import deprecate
 import torch.nn.functional as F
 
+
+def get_sinusoidal_pe(
+    uv_coords: torch.Tensor,
+    seq_len: int,
+    head_dim: int,
+    num_faces: int = 6,
+) -> torch.Tensor:
+    """
+    Generate sinusoidal positional encoding from (u, v) coordinates.
+
+    Key insight: attn1 in CubeDiffTransformerBlock receives hidden_states that have been
+    rearranged from (B*T, hw, C) → (B, T*hw, C), so seq_len = T * hw (e.g. 6*4096=24576).
+    We split seq_len back into per-face hw, generate PE per face, then rearrange back.
+
+    Args:
+        uv_coords: (B*T, 2, H_base, W_base) — base-resolution UV coordinate map.
+        seq_len:   T * hw — total sequence length seen by attn1 after face concatenation.
+        head_dim:  Dimension per attention head.
+        num_faces: Number of cubemap faces (default 6).
+
+    Returns:
+        (B, seq_len, head_dim) — PE tensor ready to broadcast over heads.
+    """
+    bt = uv_coords.shape[0]       # B*T
+    T = num_faces
+    B = bt // T
+    device = uv_coords.device
+
+    # Recover per-face spatial size: seq_len = T * hw
+    assert seq_len % T == 0, f"seq_len={seq_len} is not divisible by num_faces={T}"
+    hw = seq_len // T
+    h = w = int(math.sqrt(hw))
+    assert h * w == hw, f"per-face hw={hw} is not a perfect square"
+
+    # Downsample UV map to current feature resolution: (B*T, 2, H_base, W_base) -> (B*T, 2, h, w)
+    uv_float = uv_coords.float()
+    uv_resized = F.interpolate(uv_float, size=(h, w), mode='bilinear', align_corners=False)
+
+    # Flatten spatial dims: (B*T, 2, h, w) -> (B*T, hw, 2)
+    uv_flat = uv_resized.permute(0, 2, 3, 1).reshape(bt, hw, 2)
+
+    # NeRF-style sinusoidal encoding:
+    # head_dim split into 4 parts (u_sin, u_cos, v_sin, v_cos) × num_bands
+    num_bands = head_dim // 4
+    remainder = head_dim - num_bands * 4
+
+    if num_bands > 0:
+        freq_bands = (2.0 ** torch.arange(num_bands, dtype=torch.float32, device=device)) * math.pi
+        # angles: (B*T, hw, 2, num_bands)
+        angles = uv_flat.unsqueeze(-1) * freq_bands.view(1, 1, 1, -1)
+        sin_enc = torch.sin(angles)
+        cos_enc = torch.cos(angles)
+        # Interleave sin/cos: (B*T, hw, 2, num_bands, 2) -> (B*T, hw, 4*num_bands)
+        pe_per_face = torch.stack([sin_enc, cos_enc], dim=-1).reshape(bt, hw, 4 * num_bands)
+    else:
+        pe_per_face = uv_flat.new_zeros(bt, hw, 0)
+
+    if remainder > 0:
+        pe_per_face = torch.cat([pe_per_face, uv_flat.new_zeros(bt, hw, remainder)], dim=-1)
+    # pe_per_face: (B*T, hw, head_dim)
+
+    # Rearrange to match CubeDiffTransformerBlock's rearrange order:
+    # (B*T, hw, head_dim) -> (B, T, hw, head_dim) -> (B, T*hw, head_dim)
+    pe = pe_per_face.reshape(B, T, hw, head_dim).reshape(B, T * hw, head_dim)
+
+    return pe  # (B, seq_len, head_dim), float32
+
+
+
 class CubeDiffAttnProcessor:
     r"""
-    A custom processor for CubeDiff that uses PyTorch 2.0+ scaled dot-product attention
-    without modifying or reshaping the attention mask.
+    A custom processor for CubeDiff that uses PyTorch 2.0+ scaled dot-product attention.
+    Injects sinusoidal positional encoding into Query and Key for cross-view self-attention.
     """
 
     def __init__(self):
@@ -24,12 +94,13 @@ class CubeDiffAttnProcessor:
         attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.Tensor] = None,
         ip_adapter_image_embeds: Optional[list] = None,  # Accept but ignore for attn1
+        uv_coords: Optional[torch.Tensor] = None,  # Explicit param: Diffusers filters unknown kwargs!
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        # ip_adapter_image_embeds is accepted in signature to prevent diffusers warnings,
-        # but ignored here - this processor is for Self-Attention (attn1).
-        # IP-Adapter embeddings are handled by attn2's CubeDiffIPAdapterAttnProcessor.
+        # uv_coords: (B*T, 2, H, W) UV coordinate map for sinusoidal PE injection into Q/K.
+        # Must be in explicit signature — Diffusers inspects __call__ and silently drops
+        # any cross_attention_kwargs keys that are not declared here.
         
         if len(args) > 0 or kwargs.get("scale", None) is not None:
             deprecation_message = "The `scale` argument is deprecated and will be ignored."
@@ -72,6 +143,17 @@ class CubeDiffAttnProcessor:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
+
+        # === Inject sinusoidal PE into Q and K ===
+        if uv_coords is not None:
+            seq_len = query.shape[2]  # T * hw (faces are concatenated before attn1)
+            pe = get_sinusoidal_pe(uv_coords, seq_len, head_dim)
+            # pe: (B, seq_len, head_dim) — cast to query dtype/device
+            pe = pe.to(dtype=query.dtype, device=query.device)
+            # Unsqueeze for heads: (B, 1, seq_len, head_dim) broadcasts over (B, heads, seq_len, head_dim)
+            pe = pe.unsqueeze(1)
+            query = query + pe
+            key = key + pe
 
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
@@ -288,6 +370,9 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        # Extract uv_coords safely — do NOT pop from original dict (shared across blocks)
+        uv_coords = cross_attention_kwargs.get("uv_coords", None)
+
         # reshape to attend to all faces
         norm_hidden_states = rearrange(norm_hidden_states, "(b t) (hw) c -> b (t hw) c", b=B, t=T, hw=hw)
 
@@ -306,11 +391,16 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         else:
             self_attention_mask = None
 
+        # Build kwargs for attn1 — pass uv_coords for PE injection
+        attn1_kwargs = {k: v for k, v in cross_attention_kwargs.items() 
+                        if k not in ("uv_coords", "front_face_drop")}
+        attn1_kwargs["uv_coords"] = uv_coords
+
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
             attention_mask=self_attention_mask,
-            **cross_attention_kwargs,
+            **attn1_kwargs,
         )
 
         # Delete the attention mask to save memory
@@ -351,11 +441,15 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
             if self.pos_embed is not None and self.norm_type != "ada_norm_single":
                 norm_hidden_states = self.pos_embed(norm_hidden_states)
 
+            # Build clean kwargs for attn2 — exclude uv_coords (not needed for cross-attention)
+            attn2_kwargs = {k: v for k, v in cross_attention_kwargs.items() 
+                           if k not in ("uv_coords", "front_face_drop")}
+
             attn_output = self.attn2(
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=encoder_attention_mask,
-                **cross_attention_kwargs,
+                **attn2_kwargs,
             )
 
             hidden_states = attn_output + hidden_states
@@ -391,6 +485,3 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
             hidden_states = hidden_states.squeeze(1)
 
         return hidden_states
-
-
-

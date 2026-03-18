@@ -1,6 +1,6 @@
-import torch.nn as nn
 import torch
 import math
+
 
 def calculate_positional_encoding(resolution=(128, 128), fov_deg=95.0):
     """
@@ -41,16 +41,22 @@ def calculate_positional_encoding(resolution=(128, 128), fov_deg=95.0):
 
     return encodings
 
-def mask_tensors(batch_size, latent_height, latent_width, num_faces=6):
-    mask = torch.zeros((batch_size * num_faces, 1, latent_height, latent_width), dtype=torch.float16) # Shape: (B*T, 1, H, W)
-    front_indices = torch.arange(0, batch_size * num_faces, num_faces) # Front face indices (0, 6, 12, ...)
-    mask[front_indices] = 1.0
-    return mask
 
-def encoding_tensors(batch_size, latent_height, latent_width, face_order=None, encodings=None):
+def get_uv_tensors(batch_size, latent_height, latent_width, face_order=None, encodings=None):
     """
-    Generate stacked u_enc and v_enc channels for each face in a CubeDiff batch.
-    Returns tensor of shape (B*T, 2, H, W)
+    Generate stacked (u, v) coordinate tensors for each face in a CubeDiff batch.
+    
+    Args:
+        batch_size: Number of samples in the batch (B).
+        latent_height: Height of the latent feature map.
+        latent_width: Width of the latent feature map.
+        face_order: Optional list of face names. Defaults to 
+                     ["front", "back", "left", "right", "top", "bottom"].
+        encodings: Optional pre-computed encodings dict from calculate_positional_encoding.
+    
+    Returns:
+        Tensor of shape (B*T, 2, H, W) where T=6, containing (u, v) coordinates
+        for each face at the given latent resolution.
     """
     if face_order is None:
         face_order = ["front", "back", "left", "right", "top", "bottom"]
@@ -58,16 +64,11 @@ def encoding_tensors(batch_size, latent_height, latent_width, face_order=None, e
     if encodings is None:
         encodings = calculate_positional_encoding((latent_height, latent_width))
 
-    per_face_tensor = torch.stack([encodings[face] for face in face_order], dim=0)  # (T, 2, H, W)
-    expanded_tensor = per_face_tensor.repeat(batch_size, 1, 1, 1, 1)  # (B, T, 2, H, W)
-    stacked = expanded_tensor.reshape(batch_size * len(face_order), 2, latent_height, latent_width).to(dtype=torch.float16)  # (B*T, 2, H, W)
-    return stacked
-
-def make_extra_channels_tensor(batch_size, latent_height, latent_width, face_order=None, encodings=None):
-    """
-    Combine encoding tensors and mask tensors into a single (B*T, 3, H, W) tensor.
-    Channel 0-1: u_enc, v_enc, Channel 2: binary mask
-    """
-    enc_tensor = encoding_tensors(batch_size, latent_height, latent_width, face_order, encodings)  # (B*T, 2, H, W)
-    mask_tensor = mask_tensors(batch_size, latent_height, latent_width)  # (B*T, 1, H, W)
-    return torch.cat([enc_tensor, mask_tensor], dim=1).to(dtype=torch.float16)  # (B*T, 3, H, W)
+    # Stack all faces: (T, 2, H, W)
+    per_face_tensor = torch.stack([encodings[face] for face in face_order], dim=0)
+    
+    # Expand for batch: (B, T, 2, H, W) -> (B*T, 2, H, W)
+    expanded = per_face_tensor.unsqueeze(0).expand(batch_size, -1, -1, -1, -1)
+    stacked = expanded.reshape(batch_size * len(face_order), 2, latent_height, latent_width)
+    
+    return stacked  # float32, to be moved to device/dtype by caller

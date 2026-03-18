@@ -39,6 +39,9 @@ training:
   ip_adapter_subfolder: "models"
   ip_adapter_weight_name: "ip-adapter_sd15.bin"
 
+  # CubeDiff pretrained weights (7-ch -> 4-ch slicing applied automatically)
+  cubediff_weights: "/home/dell/code/PolyDiff/models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
+
 # Model & Data parameters
 model:
   id: "runwayml/stable-diffusion-v1-5"  # 使用您已缓存的模型

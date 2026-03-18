@@ -33,7 +33,8 @@ from training.dataset import (
     preextracted_cubemap_collate_fn
 )
 from cubediff.pipelines.pipeline import CubeDiffPipeline
-from cubediff.modules.extra_channels import make_extra_channels_tensor
+from cubediff.modules.extra_channels import get_uv_tensors
+from cubediff.modules.utils import load_sliced_unet_weights
 
 
 def main(cfg: DictConfig):
@@ -104,6 +105,23 @@ def main(cfg: DictConfig):
     if accelerator.is_main_process:
         print("[DEBUG] Pipeline loaded.")
 
+    # Load CubeDiff pretrained weights (7→4 channel slicing) if specified
+    cubediff_weights = getattr(cfg.training, 'cubediff_weights', None)
+    if cubediff_weights is not None:
+        cubediff_weights = os.path.expanduser(cubediff_weights)
+        if os.path.exists(cubediff_weights):
+            if cubediff_weights.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                sd = load_file(cubediff_weights, device="cpu")
+            else:
+                sd = torch.load(cubediff_weights, map_location="cpu")
+            load_sliced_unet_weights(pipe.unet, sd)
+            if accelerator.is_main_process:
+                print(f"[INFO] Loaded CubeDiff weights from {cubediff_weights}")
+        else:
+            if accelerator.is_main_process:
+                print(f"[WARNING] CubeDiff weights not found: {cubediff_weights}")
+
     # Configure scheduler
     if cfg.training.prediction_type == "v_prediction":
         pipe.scheduler = DDIMScheduler.from_pretrained(
@@ -145,9 +163,7 @@ def main(cfg: DictConfig):
     for param in pipe.text_encoder.parameters():
         param.requires_grad = False
     
-    # Unfreeze conv_in
-    for name, param in pipe.unet.conv_in.named_parameters():
-        param.requires_grad = True
+    # conv_in is NOT unfrozen — we use standard SD1.5 4-channel weights directly
 
     # Unfreeze attention layers (but NOT IP-Adapter layers)
     for name, param in pipe.unet.named_parameters():
@@ -198,7 +214,7 @@ def main(cfg: DictConfig):
             prompt_dir=cfg.directories.prompt_dir,
             face_size=cfg.model.image_size,
             augment=False,  # ⭐ 关闭增强，使用原始顺序
-            return_ref_images=False  # 验证不需要参考图
+            return_ref_images=use_ip_adapter  # IP-Adapter 开启时加载参考图
         )
     else:
         val_dataset = dataset  # ERP 模式下使用相同 dataset
@@ -207,6 +223,8 @@ def main(cfg: DictConfig):
     val_sample_fixed = val_dataset[0]
     val_conditioning_image_fixed = val_sample_fixed[0][0]  # Front face (原始)
     val_prompts_fixed = val_sample_fixed[1]  # 原始顺序的 prompts
+    # 提取验证集的参考图（用于 IP-Adapter）
+    val_ref_images_fixed = val_sample_fixed[2] if (use_ip_adapter and len(val_sample_fixed) > 2) else None
     
     if accelerator.is_main_process:
         print(f"[INFO] Validation sample: scene {val_sample_fixed[3] if len(val_sample_fixed) > 3 else '0'}")
@@ -437,15 +455,20 @@ def main(cfg: DictConfig):
                         latents[non_front_mask], noise, timesteps[non_front_mask]
                     ).to(latents.dtype)
 
-                    # Add extra channels
-                    extra_channels = make_extra_channels_tensor(B, H, W).to(latents.device)
-                    latent_input = torch.cat([latents, extra_channels], dim=1)
+                    # Pure 4-channel latent input (no extra channels concatenation)
+                    latent_input = latents
+
+                    # Generate UV coordinates for PE injection
+                    uv_coords = get_uv_tensors(B, H, W).to(latents.device, dtype=weight_dtype)
 
                     # Front face drop (10% chance)
                     front_face_drop = torch.rand(1, device=accelerator.device) < 0.1
 
                     # Prepare cross_attention_kwargs and added_cond_kwargs
-                    cross_attn_kwargs = {"front_face_drop": front_face_drop}
+                    cross_attn_kwargs = {
+                        "front_face_drop": front_face_drop,
+                        "uv_coords": uv_coords,
+                    }
                     added_cond_kwargs = {}
                     
                     if use_ip_adapter and ip_embeds_for_attn is not None:
@@ -516,8 +539,7 @@ def main(cfg: DictConfig):
                         if accelerator.is_main_process:
                             print(f"[INFO] Checkpoint saved: {ckpt_folder}")
                         accelerator.wait_for_everyone()
-                    
-                    # Step-based validation
+                                        # Step-based validation
                     if cfg.training.checkpoint_interval_type == "steps" and global_step % cfg.training.validation_interval == 0:
                         accelerator.wait_for_everyone()
                         if accelerator.is_main_process:
@@ -526,9 +548,6 @@ def main(cfg: DictConfig):
                             # Set model to eval mode
                             pipe.unet = unwrap_model(unet)
                             pipe.unet.eval()
-                            
-                            # 确保 UNet 在正确的 dtype（与训练时一致）
-                            pipe.unet.to(dtype=weight_dtype)
                             
                             # 使用预加载的固定验证样本（无增强）
                             val_conditioning_image = val_conditioning_image_fixed.to(accelerator.device, dtype=weight_dtype)
@@ -542,13 +561,17 @@ def main(cfg: DictConfig):
                                 val_prompts_for_gen = val_prompts
                             
                             try:
+                                # 把 dtype 转换放在 try 里，失败时 finally 能恢复
+                                pipe.unet.to(dtype=weight_dtype)
+
                                 # Generate sample with autocast for fp16 consistency
-                                with torch.no_grad(), torch.cuda.amp.autocast(dtype=weight_dtype):
+                                with torch.no_grad(), torch.amp.autocast('cuda', dtype=weight_dtype):
                                     pipeline_output = pipe(
                                         prompts=val_prompts_for_gen,
                                         conditioning_image=val_conditioning_image,
                                         num_inference_steps=30,  # 减少步数加快验证
                                         cfg_scale=3.5,
+                                        ip_adapter_image=val_ref_images_fixed if (use_ip_adapter and val_ref_images_fixed is not None) else None,
                                     )
                                 
                                 # Convert to PIL images
@@ -582,11 +605,14 @@ def main(cfg: DictConfig):
                                 
                             except Exception as e:
                                 print(f"[WARNING] Validation failed: {e}")
-                            
-                            # Set model back to train mode
-                            pipe.unet.train()
+                            finally:
+                                # 无论验证成功还是失败，必须恢复 fp32 + train 模式
+                                # 否则 GradScaler 会因为 fp16 梯度崩溃
+                                pipe.unet.to(dtype=torch.float32)
+                                pipe.unet.train()
                             
                         accelerator.wait_for_everyone()
+
 
         # Epoch-based checkpointing
         if cfg.training.checkpoint_interval_type == "epochs" and (epoch + 1) % cfg.training.checkpoint_interval == 0:

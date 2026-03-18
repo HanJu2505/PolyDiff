@@ -53,41 +53,43 @@ def swap_transformer_blocks(root: nn.Module) -> None:
                     
                     child.transformer_blocks[i] = new_blk
 
-def expand_input_conv(unet: UNet2DConditionModel, new_channels: int) -> None:
-    """Grow `conv_in` to `new_channels`, copying the first 4 kernels."""
-    old = unet.conv_in
-    if old.in_channels == new_channels:
-        return
+
+def load_sliced_unet_weights(unet: UNet2DConditionModel, state_dict: dict) -> None:
+    """
+    Load a CubeDiff state_dict (which may have 7-channel conv_in) into a 4-channel UNet.
     
-    new = nn.Conv2d(
-        new_channels,
-        old.out_channels,
-        kernel_size=old.kernel_size,
-        stride=old.stride,
-        padding=old.padding,
-        bias=old.bias is not None,
-    )
+    Performs "weight surgery": slices conv_in.weight from [320, 7, 3, 3] to [320, 4, 3, 3]
+    so that the pretrained CubeDiff weights can be safely loaded into a standard 4-channel UNet.
     
-    with torch.no_grad():
-        new.weight.zero_()
-        new.weight[:, : old.in_channels] = old.weight
-        if old.bias is not None:
-            new.bias.copy_(old.bias)
+    Args:
+        unet: The target UNet2DConditionModel with 4-channel conv_in.
+        state_dict: The source state_dict, potentially from a 7-channel CubeDiff checkpoint.
+    """
+    sliced_keys = []
+    for key in list(state_dict.keys()):
+        if key.endswith("conv_in.weight"):
+            tensor = state_dict[key]
+            if tensor.shape[1] == 7:
+                state_dict[key] = tensor[:, :4, :, :]
+                sliced_keys.append(key)
+                print(f"[CubeDiff] Sliced {key} from {list(tensor.shape)} to {list(state_dict[key].shape)}")
     
-    unet.conv_in = new
+    # Load with strict=False to skip any remaining mismatched keys
+    missing, unexpected = unet.load_state_dict(state_dict, strict=False)
+    
+    if sliced_keys:
+        print(f"[CubeDiff] Successfully sliced conv_in.weight from 7 to 4 channels.")
+    if missing:
+        print(f"[CubeDiff] Missing keys (expected): {len(missing)} keys")
+    if unexpected:
+        print(f"[CubeDiff] Unexpected keys (ignored): {len(unexpected)} keys")
 
 
-def patch_unet(unet: UNet2DConditionModel, in_channels: int = 7) -> UNet2DConditionModel:
-    """Patch a base UNet to CubeDiff architecture."""
+def patch_unet(unet: UNet2DConditionModel) -> UNet2DConditionModel:
+    """Patch a base UNet to CubeDiff architecture (attention blocks only, no channel expansion)."""
 
     # Swap transformer blocks
     swap_transformer_blocks(unet)
-    
-    # Expand input conv layer
-    expand_input_conv(unet, in_channels)
-
-    # Update config
-    unet.register_to_config(in_channels=in_channels)
     
     return unet
 

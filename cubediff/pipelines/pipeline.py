@@ -8,8 +8,8 @@ from tqdm.auto import tqdm
 from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_output import BaseOutput
 from diffusers.image_processor import PipelineImageInput
-from ..modules.extra_channels import make_extra_channels_tensor
-from ..modules.utils import patch_groupnorm, patch_unet, swap_transformer_blocks
+from ..modules.extra_channels import get_uv_tensors
+from ..modules.utils import patch_groupnorm, patch_unet, swap_transformer_blocks, load_sliced_unet_weights
 from .postprocessing import postprocess_outputs
 from dataclasses import dataclass
 
@@ -24,26 +24,36 @@ class CubeDiffPipelineOutput(BaseOutput):
 class CubeDiffPipeline(StableDiffusionPipeline):
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path, cubediff_weights_path=None, **kwargs):
         """
-        Load CubeDiffPipeline from pretrained model and automatically apply CubeDiff patches.
+        Load CubeDiffPipeline from a base SD1.5 model, apply CubeDiff attention patches,
+        and optionally load CubeDiff pretrained weights (with 7→4 channel slicing).
         
-        The pretrained model should already have the correct input conv layer (7 channels),
-        but we still need to patch the attention mechanisms and group norms.
+        Args:
+            pretrained_model_name_or_path: Path to base SD1.5 model (must be 4-channel).
+            cubediff_weights_path: Optional path to CubeDiff checkpoint (.bin/.safetensors).
+                                   If provided, weights are loaded with 7→4 channel slicing.
         """
 
-        # Load the base pipeline
+        # Load the base pipeline (must be a standard 4-channel SD1.5 model)
         pipeline = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
         
-        if pipeline.unet.config.in_channels != 7:
-            # Is a base SD model, patch input conv as well
-            patch_unet(pipeline.unet, in_channels=7)
-        else:
-            # Apply attention patches (swap BasicTransformerBlock -> CubeDiffTransformerBlock)
-            swap_transformer_blocks(pipeline.unet)
+        # Apply CubeDiff attention patches (swap BasicTransformerBlock -> CubeDiffTransformerBlock)
+        swap_transformer_blocks(pipeline.unet)
         
         # Apply groupnorm patches (GroupNorm -> CubeDiffGroupNorm)
         patch_groupnorm(pipeline.vae)
+        
+        # Load CubeDiff pretrained weights with 7→4 channel slicing if provided
+        if cubediff_weights_path is not None:
+            import os
+            if cubediff_weights_path.endswith('.safetensors'):
+                from safetensors.torch import load_file
+                state_dict = load_file(cubediff_weights_path, device="cpu")
+            else:
+                state_dict = torch.load(cubediff_weights_path, map_location="cpu")
+            load_sliced_unet_weights(pipeline.unet, state_dict)
+            print(f"[CubeDiff] Loaded CubeDiff weights from {os.path.basename(cubediff_weights_path)}")
     
         return pipeline
 
@@ -313,15 +323,17 @@ class CubeDiffPipeline(StableDiffusionPipeline):
 
         # --- scheduler / latents -------------------------------------------
         self.scheduler.set_timesteps(num_inference_steps, device=device)
+        sample_size = self.unet.config.sample_size
         latents = torch.randn(
-            (T, 4, self.unet.config.sample_size, self.unet.config.sample_size),
+            (T, 4, sample_size, sample_size),
             generator=generator,
             device=device,
             dtype=self.unet.dtype,
         )
         latents *= self.scheduler.init_noise_sigma
 
-        static_extra = make_extra_channels_tensor(1, self.unet.config.sample_size, self.unet.config.sample_size).to(device, dtype=self.unet.dtype)
+        # Generate UV coordinates for PE injection (computed once, reused every step)
+        uv_coords = get_uv_tensors(1, sample_size, sample_size).to(device, dtype=self.unet.dtype)
 
         if conditioning_image.ndim == 3:
             conditioning_image = conditioning_image.unsqueeze(0)
@@ -340,10 +352,12 @@ class CubeDiffPipeline(StableDiffusionPipeline):
         for i, t in enumerate(progress_bar):
             latents[0] = ref_lat  # keep front face fixed
             latents_scaled = self.scheduler.scale_model_input(latents, t)
-            latents_input = torch.cat([latents_scaled, static_extra], dim=1)
+            # Pure 4-channel latent input (no extra channels concatenation)
+            latents_input = latents_scaled
 
             # 4. Conditional Forward (with cond IP-Adapter embeds)
             iter_kwargs = cross_attention_kwargs.copy()
+            iter_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection
             
             # Prepare added_cond_kwargs with RAW image_embeds (UNet requires this for encoder_hid_dim_type='ip_image_proj')
             # Also pass PROJECTED embeds via cross_attention_kwargs for our decoupled attention processor
@@ -351,6 +365,11 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             if cond_image_embeds is not None:
                 iter_kwargs["ip_adapter_image_embeds"] = cond_image_embeds  # Projected, for decoupled attention
                 added_cond["image_embeds"] = cond_raw_for_unet  # Raw, for UNet's concatenation path
+            elif getattr(self.unet.config, 'encoder_hid_dim_type', None) == 'ip_image_proj':
+                # UNet config requires image_embeds even when no IP-Adapter image is given
+                # Pass zero vector as placeholder (6 faces × 1024-dim CLIP embedding)
+                added_cond["image_embeds"] = torch.zeros(T, 1024, device=device, dtype=self.unet.dtype)
+
             
             noise_pred = self.unet(
                 latents_input, 
@@ -363,12 +382,16 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             # 5. Unconditional Forward (with uncond IP-Adapter embeds)
             iter_uncond_kwargs = cross_attention_kwargs.copy()
             iter_uncond_kwargs["front_face_drop"] = True  # CubeDiff specific
+            iter_uncond_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection
             
             # Prepare added_cond_kwargs for unconditional pass
             added_uncond = {}
             if uncond_image_embeds is not None:
                 iter_uncond_kwargs["ip_adapter_image_embeds"] = uncond_image_embeds  # Projected
                 added_uncond["image_embeds"] = uncond_raw_for_unet  # Raw
+            elif getattr(self.unet.config, 'encoder_hid_dim_type', None) == 'ip_image_proj':
+                added_uncond["image_embeds"] = torch.zeros(T, 1024, device=device, dtype=self.unet.dtype)
+
             
             noise_pred_uncond = self.unet(
                 latents_input,

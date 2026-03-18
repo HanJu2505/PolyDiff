@@ -10,7 +10,7 @@ Features:
   - Edge-by-edge seam repair
 
 Usage:
-    python inference_polydiff_ip.py
+    python inference_polydiff_v2_ip.py
 """
 
 import torch
