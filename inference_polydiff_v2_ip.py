@@ -133,8 +133,14 @@ if __name__ == "__main__":
     
     # =================================================
     
-    # Model checkpoint (CubeDiff)
-    CHECKPOINT = "./models/cubediff-512-multitxt"
+    # Base model (SD1.5, provides 4-channel UNet architecture)
+    BASE_MODEL = "runwayml/stable-diffusion-v1-5"
+    
+    # CubeDiff UNet weights (7→4 channel slicing applied automatically)
+    # Option A: original CubeDiff pretrained weights
+    # CUBEDIFF_WEIGHTS = "./models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
+    # Option B: your fine-tuned checkpoint (uncomment and set path)
+    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter/epoch_40_step_880_final/model.safetensors"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
@@ -148,13 +154,14 @@ if __name__ == "__main__":
     
     # Seam repair parameters (edge-by-edge)
     SEAM_WIDTH = 50      # Width of seam region
-    FEATHER = 30          # Feather width for blending
-    INPAINT_STEPS = 20    # Inpainting steps per edge
+    FEATHER = 30         # Feather width for blending
+    INPAINT_STEPS = 20   # Inpainting steps per edge
     INPAINT_STRENGTH = 0.55
-    DEBUG_SEAMS = True    # Save debug images for each edge
+    DEBUG_SEAMS = True   # Save debug images for each edge
     
     # ================================================
 
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     debug_dir = os.path.join(OUTPUT_DIR, "debug") if DEBUG_SEAMS else None
@@ -168,9 +175,15 @@ if __name__ == "__main__":
         print("         IP-Adapter: ENABLED")
     print("="*60)
     
-    # Load CubeDiff pipeline
-    print(f"[INFO] Loading CubeDiff Pipeline from {CHECKPOINT}...")
-    cubediff_pipe = CubeDiffPipeline.from_pretrained(CHECKPOINT).to(device)
+    # Load CubeDiff pipeline (two-step: SD1.5 base + CubeDiff weights with 7→4 slicing)
+    print(f"[INFO] Loading CubeDiff Pipeline...")
+    print(f"       Base: {BASE_MODEL}")
+    print(f"       Weights: {CUBEDIFF_WEIGHTS}")
+    cubediff_pipe = CubeDiffPipeline.from_pretrained(
+        BASE_MODEL,
+        cubediff_weights_path=CUBEDIFF_WEIGHTS,
+    ).to(device)
+
     
     # Load IP-Adapter if enabled
     ip_adapter_images = None
@@ -241,9 +254,8 @@ if __name__ == "__main__":
     output = cubediff_pipe(
         prompts=prompt_list,
         conditioning_image=conditioning_image.unsqueeze(0).to(device),
-        # 关键修改：用中括号 [] 把 ip_adapter_images 包起来
-        # 外层列表长度=1 对应 1个IP-Adapter，内层列表长度=6 对应 Batch Size=6
-        ip_adapter_image=[ip_adapter_images] if ip_adapter_images is not None else None,
+        # Pipeline 使用方案B（逐面独立CLIP编码），直接传 6 张图的列表即可
+        ip_adapter_image=ip_adapter_images if ip_adapter_images is not None else None,
         num_inference_steps=NUM_INFERENCE_STEPS,
         cfg_scale=CFG_SCALE,
     )

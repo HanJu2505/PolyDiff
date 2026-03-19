@@ -561,15 +561,15 @@ def main(cfg: DictConfig):
                                 val_prompts_for_gen = val_prompts
                             
                             try:
-                                # 把 dtype 转换放在 try 里，失败时 finally 能恢复
-                                pipe.unet.to(dtype=weight_dtype)
-
-                                # Generate sample with autocast for fp16 consistency
+                                # ⚠️ 不要调用 .to(dtype=weight_dtype)！
+                                # .to(dtype) 会创建新 Tensor 对象，断开优化器与参数的引用关系，
+                                # 导致第一次验证后权重永远不再被更新。
+                                # 直接用 autocast 即可——它只改变计算精度，不改变存储 dtype。
                                 with torch.no_grad(), torch.amp.autocast('cuda', dtype=weight_dtype):
                                     pipeline_output = pipe(
                                         prompts=val_prompts_for_gen,
                                         conditioning_image=val_conditioning_image,
-                                        num_inference_steps=30,  # 减少步数加快验证
+                                        num_inference_steps=30,
                                         cfg_scale=3.5,
                                         ip_adapter_image=val_ref_images_fixed if (use_ip_adapter and val_ref_images_fixed is not None) else None,
                                     )
@@ -606,10 +606,9 @@ def main(cfg: DictConfig):
                             except Exception as e:
                                 print(f"[WARNING] Validation failed: {e}")
                             finally:
-                                # 无论验证成功还是失败，必须恢复 fp32 + train 模式
-                                # 否则 GradScaler 会因为 fp16 梯度崩溃
-                                pipe.unet.to(dtype=torch.float32)
+                                # 只需切回 train 模式，不改变 dtype
                                 pipe.unet.train()
+
                             
                         accelerator.wait_for_everyone()
 
