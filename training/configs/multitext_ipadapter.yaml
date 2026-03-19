@@ -10,7 +10,7 @@ name: "polydiff-multitext-ipadapter"
 # Training parameters
 training:
   seed: 42
-  epochs: 20
+  epochs: 40
   batch_size: 16        # Global batch size - 增大以提高稳定性
   per_gpu_batch_size: 1 # Per GPU batch size
   learning_rate: 1e-4   # 提高学习率加快收敛

@@ -240,82 +240,55 @@ class CubeDiffPipeline(StableDiffusionPipeline):
         )
         uncond_embeddings = self.text_encoder(uncond_inputs.input_ids.to(device))[0]
 
-        # 2. Prepare IP-Adapter Image Embeddings
+        # 2. Prepare IP-Adapter Image Embeddings (per-face, independent)
         cond_image_embeds = None
         uncond_image_embeds = None
-        
+        cond_raw_for_unet = None
+        uncond_raw_for_unet = None
+
         if ip_adapter_image is not None:
-            # Check if IP-Adapter is loaded
             if not hasattr(self, 'image_encoder') or self.image_encoder is None:
                 raise ValueError("IP-Adapter not loaded. Call load_ip_adapter() first.")
-            
-            # prepare_ip_adapter_image_embeds handles list input automatically
-            # If input is 6 images, it generates embeddings for each
-            image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image,
-                None,  # negative image (will use zeros)
-                device,
-                1,  # 【关键修改】每张图对应1份特征，而非6份
-                do_classifier_free_guidance=(cfg_scale > 1.0),
-            )
-            
-            # ===== DEBUG: 打印嵌入形状 =====
-            print(f"\n[DEBUG] IP-Adapter image_embeds type: {type(image_embeds)}")
-            if isinstance(image_embeds, list):
-                print(f"[DEBUG] image_embeds list length: {len(image_embeds)}")
-                for i, emb in enumerate(image_embeds):
-                    print(f"[DEBUG] image_embeds[{i}] shape: {emb.shape}")
-            else:
-                print(f"[DEBUG] image_embeds shape: {image_embeds.shape}")
-            # ================================
-            
-            # image_embeds is a list with one element per IP-Adapter
-            # With batch_size=1 and 6 images + CFG, shape is [2, 6, num_tokens, dim]
-            # Index 0 = uncond (negative), Index 1 = cond (positive)
-            if isinstance(image_embeds, list):
-                image_embeds = image_embeds[0]  # Get first IP-Adapter's embeddings
-            
-            print(f"[DEBUG] After extracting from list, image_embeds shape: {image_embeds.shape}")
-            
-            # Split embeddings: [0] for uncond, [1] for cond
-            # Each has shape [6, dim] after indexing (raw CLIP output)
-            uncond_raw = image_embeds[0]  # [6, 1024]
-            cond_raw = image_embeds[1]    # [6, 1024]
-            
-            # Store raw embeddings for added_cond_kwargs (UNet requires this)
-            uncond_raw_for_unet = uncond_raw
+
+            # Normalize input: accept a single image or a list of T images
+            if not isinstance(ip_adapter_image, (list, tuple)):
+                ip_adapter_image = [ip_adapter_image] * T
+            if len(ip_adapter_image) != T:
+                raise ValueError(f"Expected {T} ip_adapter_image(s) (one per face), got {len(ip_adapter_image)}")
+
+            # Encode each face image independently through CLIP image encoder
+            # This bypasses prepare_ip_adapter_image_embeds which mistakes a list of 6
+            # images for "6 IP Adapters" rather than "6 face references for 1 IP Adapter".
+            face_embeds = []
+            for img in ip_adapter_image:
+                pv = self.feature_extractor(images=img, return_tensors="pt").pixel_values
+                pv = pv.to(device=device, dtype=self.image_encoder.dtype)
+                emb = self.image_encoder(pv).image_embeds  # (1, 1024)
+                face_embeds.append(emb)
+
+            cond_raw = torch.cat(face_embeds, dim=0)                    # (T, 1024)
+            uncond_raw = torch.zeros_like(cond_raw)                     # (T, 1024) zeros = no style
+
             cond_raw_for_unet = cond_raw
-            
-            # Project through encoder_hid_proj to get [6, num_tokens, cross_attention_dim]
-            # This is required for the to_k_ip/to_v_ip layers in our processor
+            uncond_raw_for_unet = uncond_raw
+
+            # Project to cross-attention dim for our CubeDiffIPAdapterAttnProcessor
             if hasattr(self.unet, 'encoder_hid_proj') and self.unet.encoder_hid_proj is not None:
-                uncond_projected = self.unet.encoder_hid_proj(uncond_raw)
-                cond_projected = self.unet.encoder_hid_proj(cond_raw)
-                
-                # encoder_hid_proj may return a list - extract tensor if so
-                if isinstance(uncond_projected, list):
-                    uncond_projected = uncond_projected[0]
-                if isinstance(cond_projected, list):
-                    cond_projected = cond_projected[0]
-                
-                # Reshape: remove extra dimension if present [6,1,4,768] -> [6,4,768]
-                if uncond_projected.ndim == 4:
-                    uncond_projected = uncond_projected.squeeze(1)
-                if cond_projected.ndim == 4:
-                    cond_projected = cond_projected.squeeze(1)
-                
-                uncond_image_embeds = [uncond_projected]  # For cross_attention_kwargs (decoupled)
-                cond_image_embeds = [cond_projected]      # For cross_attention_kwargs (decoupled)
-                
-                print(f"[DEBUG] After projection - uncond shape: {uncond_projected.shape}")
-                print(f"[DEBUG] After projection - cond shape: {cond_projected.shape}\n")
+                cond_proj = self.unet.encoder_hid_proj(cond_raw)        # (T, num_tokens, 768) or (T,1,num_tokens,768)
+                uncond_proj = self.unet.encoder_hid_proj(uncond_raw)
+
+                # Handle extra dim if present: (T,1,num_tokens,768) → (T,num_tokens,768)
+                if isinstance(cond_proj, list):   cond_proj   = cond_proj[0]
+                if isinstance(uncond_proj, list): uncond_proj = uncond_proj[0]
+                if cond_proj.ndim   == 4: cond_proj   = cond_proj.squeeze(1)
+                if uncond_proj.ndim == 4: uncond_proj = uncond_proj.squeeze(1)
+
+                cond_image_embeds   = [cond_proj]     # (T, num_tokens, 768)
+                uncond_image_embeds = [uncond_proj]
             else:
-                # Fallback: use raw embeddings (may not work correctly)
+                cond_image_embeds   = [cond_raw]
                 uncond_image_embeds = [uncond_raw]
-                cond_image_embeds = [cond_raw]
-                uncond_raw_for_unet = uncond_raw
-                cond_raw_for_unet = cond_raw
-                print(f"[DEBUG] No encoder_hid_proj found, using raw embeddings\n")
+
 
         # 3. Initialize cross_attention_kwargs
         if cross_attention_kwargs is None:
