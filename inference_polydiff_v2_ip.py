@@ -140,7 +140,7 @@ if __name__ == "__main__":
     # Option A: original CubeDiff pretrained weights
     # CUBEDIFF_WEIGHTS = "./models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
     # Option B: your fine-tuned checkpoint (uncomment and set path)
-    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter/epoch_40_step_880_final/model.safetensors"
+    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter-re/epoch_40_step_880_final/model.safetensors"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]

@@ -10,6 +10,7 @@ Usage:
     python train_ipadapter.py --config multitext_ipadapter
 """
 
+import math
 import os
 
 import argparse
@@ -251,10 +252,24 @@ def main(cfg: DictConfig):
         eps=cfg.training.eps
     )
     
-    def lr_lambda(current_step):
-        return current_step / cfg.training.warmup_steps if current_step < cfg.training.warmup_steps else 1.0
-    
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # 计算总训练步数（用于余弦退火终点）
+    steps_per_epoch = len(dataloader) // cfg.training.gradient_accumulation_steps
+    total_steps = cfg.training.epochs * steps_per_epoch
+    min_lr = 1e-5  # 余弦退火最低学习率
+
+    def lr_lambda_cosine(current_step):
+        warmup = cfg.training.warmup_steps
+        if current_step < warmup:
+            # 线性 warmup
+            return current_step / max(1, warmup)
+        # 余弦退火：从 peak_lr 衰减到 min_lr
+        progress = (current_step - warmup) / max(1, total_steps - warmup)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # 缩放到 [min_lr/peak_lr, 1.0] 区间
+        min_ratio = min_lr / cfg.training.learning_rate
+        return min_ratio + (1.0 - min_ratio) * cosine_decay
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_cosine)
     
     # --------------------- Prepare components -----------------------
     unet, optimizer, dataloader = accelerator.prepare(
@@ -314,12 +329,12 @@ def main(cfg: DictConfig):
             accelerator.load_state(resume_ckpt)
             if accelerator.is_main_process:
                 print(f"[INFO] Resumed from {resume_ckpt}, epoch {start_epoch}, step {global_step}")
-            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=global_step - 1)
+            lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_cosine, last_epoch=global_step - 1)
 
     # ---------------------- Training Loop ----------------------
     epochs = cfg.training.epochs
     T = 6  # Number of faces
-    checkpoint_dir = os.path.join(cfg.directories.checkpoint_dir, f"{cfg.name}")
+    checkpoint_dir = cfg.directories.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
     step_start_time = time.time()
     
