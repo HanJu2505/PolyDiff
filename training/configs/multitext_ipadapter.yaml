@@ -49,7 +49,7 @@ model:
 
 # Directories
 directories:
-  checkpoint_dir: "./checkpoints/polydiff-multitext-ipadapter-re"
+  checkpoint_dir: "./checkpoints/polydiff-multitext-ipadapter-1000"
   cache_dir: "~/.cache/huggingface/hub"  # 使用 HuggingFace 默认缓存目录
   
   # Pre-extracted cubemap data directories

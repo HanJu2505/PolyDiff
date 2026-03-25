@@ -253,7 +253,7 @@ def main(cfg: DictConfig):
     )
     
     # 计算总训练步数（用于余弦退火终点）
-    steps_per_epoch = len(dataloader) // cfg.training.gradient_accumulation_steps
+    steps_per_epoch = len(dataloader) // acc_steps
     total_steps = cfg.training.epochs * steps_per_epoch
     min_lr = 1e-5  # 余弦退火最低学习率
 
@@ -374,10 +374,13 @@ def main(cfg: DictConfig):
                         B = latents.shape[0] // T
                         _, _, H, W = latents.shape
 
-                        # Prompt dropout (10% chance)
+                        # Sample-level conditional dropout (10% chance).
+                        # A dropped sample becomes unconditional for all 6 faces:
+                        # empty text prompts + zero IP-Adapter image embeddings.
                         mask = torch.rand(B, device=accelerator.device) < 0.1
                         full_mask = mask.repeat_interleave(T)
-                        prompts = [p if not m else "" for p, m in zip(prompts, full_mask)]
+                        full_mask_list = full_mask.tolist()
+                        prompts = [p if not dropped else "" for p, dropped in zip(prompts, full_mask_list)]
 
                         # Handle training type
                         if cfg.training.type == "image_only":
@@ -385,7 +388,7 @@ def main(cfg: DictConfig):
                         elif cfg.training.type == "single_caption":
                             prompts = []
                             for i, sc in enumerate(single_captions):
-                                if full_mask[i * T]:
+                                if full_mask_list[i * T]:
                                     prompts.extend([""] * T)
                                 else:
                                     prompts.extend([sc] * T)
@@ -434,16 +437,21 @@ def main(cfg: DictConfig):
                                 # Step 2: 获取原始 CLIP 嵌入
                                 # raw_image_embeds 形状: [num_images, 1024]
                                 raw_image_embeds = pipe.image_encoder(clip_image).image_embeds
-                                
-                                # Step 3: 保存原始嵌入用于 added_cond_kwargs
-                                # 这是 UNet 要求的，形状为 [num_images, 1024]
-                                ip_embeds_raw = raw_image_embeds
-                                
+
+                                # Step 3: Apply the same sample-level dropout to IP-Adapter.
+                                # This keeps training unconditional samples aligned with
+                                # inference CFG: empty text + zero image conditioning.
+                                dropout_scale = (~full_mask).to(
+                                    device=raw_image_embeds.device,
+                                    dtype=raw_image_embeds.dtype,
+                                ).unsqueeze(-1)
+                                ip_embeds_raw = raw_image_embeds * dropout_scale
+
                                 # Step 4: 投影嵌入用于 cross_attention_kwargs
                                 # 参照 pipeline.py 第 279 行: cond_projected = self.unet.encoder_hid_proj(cond_raw)
-                                # 注意：直接传 tensor，不要用列表包裹！
+                                # 这里使用置零后的 raw embeds，确保与 added_cond_kwargs 一致。
                                 if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
-                                    ip_embeds_projected = pipe.unet.encoder_hid_proj(raw_image_embeds)
+                                    ip_embeds_projected = pipe.unet.encoder_hid_proj(ip_embeds_raw)
                                     
                                     # encoder_hid_proj 可能返回列表
                                     if isinstance(ip_embeds_projected, list):
@@ -455,15 +463,31 @@ def main(cfg: DictConfig):
                                     
                                     # DEBUG: 打印形状（只打印一次，避免干扰进度条）
                                     if accelerator.is_main_process and not debug_printed:
+                                        dropped_samples = int(mask.sum().item())
+                                        dropped_faces = int(full_mask.sum().item())
+                                        zeroed_rows = int((ip_embeds_raw.abs().sum(dim=-1) == 0).sum().item())
                                         print(f"[DEBUG] raw_image_embeds shape: {raw_image_embeds.shape}")
+                                        print(f"[DEBUG] zeroed_ip_embeds_raw shape: {ip_embeds_raw.shape}")
                                         print(f"[DEBUG] ip_embeds_projected shape: {ip_embeds_projected.shape}")
                                         print(f"[DEBUG] B={B}, T={T}, B*T={B*T}")
+                                        print(f"[DEBUG] dropped_samples={dropped_samples}, dropped_faces={dropped_faces}")
+                                        print(f"[DEBUG] zeroed_raw_embed_rows={zeroed_rows}")
                                         debug_printed = True
                                     
                                     # 包裹成列表，对应 attn processor 的格式
                                     ip_embeds_for_attn = [ip_embeds_projected]
                                 else:
-                                    ip_embeds_for_attn = [raw_image_embeds]
+                                    if accelerator.is_main_process and not debug_printed:
+                                        dropped_samples = int(mask.sum().item())
+                                        dropped_faces = int(full_mask.sum().item())
+                                        zeroed_rows = int((ip_embeds_raw.abs().sum(dim=-1) == 0).sum().item())
+                                        print(f"[DEBUG] raw_image_embeds shape: {raw_image_embeds.shape}")
+                                        print(f"[DEBUG] zeroed_ip_embeds_raw shape: {ip_embeds_raw.shape}")
+                                        print(f"[DEBUG] B={B}, T={T}, B*T={B*T}")
+                                        print(f"[DEBUG] dropped_samples={dropped_samples}, dropped_faces={dropped_faces}")
+                                        print(f"[DEBUG] zeroed_raw_embed_rows={zeroed_rows}")
+                                        debug_printed = True
+                                    ip_embeds_for_attn = [ip_embeds_raw]
 
                     # Add noise to non-front faces
                     latents[non_front_mask] = pipe.scheduler.add_noise(

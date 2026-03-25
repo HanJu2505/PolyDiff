@@ -91,16 +91,16 @@ if __name__ == "__main__":
     # ============== USER CONFIGURATION ==============
     
     # Input image (front view anchor)
-    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png"
+    IMAGE_FILENAME = "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_front.png"
     
     # Prompts for each direction
     PROMPTS = {
-        "Front": "Church stands between two buildings",
-        "Right": "Car parked by road, sidewalk, and trees",
-        "Back": "Cars parked along road with trees and sidewalk",
-        "Left": "Car parked by road, tree, and street light",
-        "Top": "sky",
-        "Bottom": "street ",
+        "Front": "A yellow building with arched windows reflects in a water channel at night.",
+        "Right": "Illuminated yellow building reflects in water beside grassy courtyard at night.",
+        "Back": "Nighttime town square with illuminated buildings, paved walkway, and grassy area.",
+        "Left": "A cobblestone square at night flanked by two lit buildings.",
+        "Top": "A dark hexagonal aperture centered in a near-black radial gradient.",
+        "Bottom": "Paved brick ground beside a concrete curb and flowerbed.",
     }
     # PROMPTS = ""
     
@@ -112,18 +112,18 @@ if __name__ == "__main__":
     IP_ADAPTER_REPO = "h94/IP-Adapter"
     IP_ADAPTER_SUBFOLDER = "models"
     IP_ADAPTER_WEIGHT_NAME = "ip-adapter_sd15.bin" # "ip-adapter_sd15.bin" or "ip-adapter-plus_sd15.bin"
-    IP_ADAPTER_SCALE = 0.45  # Weight for IP-Adapter influence (0.0 - 1.0)
+    IP_ADAPTER_SCALE = 0.99  # Weight for IP-Adapter influence (0.0 - 1.0)
     
     # Per-face reference images (order: Front, Back, Left, Right, Top, Bottom)
     # Set to None to disable IP-Adapter for specific faces
     # Or use the same image path for all faces for global style transfer
     FACE_REF_IMAGES = {
-        "Front": None,  # Use None to skip, or provide path like "assets/ref_front.jpg"
-        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_back.png",
-        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_left.png",
-        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_right.png",
-        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_top.png",
-        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_bottom.png",
+        "Front": None, # Use None to fallback to the main conditioning input image, or provide path
+        "Back": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_back.png",
+        "Left": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_left.png",
+        "Right": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_right.png",
+        "Top": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_top.png",
+        "Bottom": "/home/dell/Datasets/Sun360/MiniVal_CubeMap/030000_bottom.png",
     }
     
     # Alternative: Use a single image for all faces (global style)
@@ -140,7 +140,7 @@ if __name__ == "__main__":
     # Option A: original CubeDiff pretrained weights
     # CUBEDIFF_WEIGHTS = "./models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
     # Option B: your fine-tuned checkpoint (uncomment and set path)
-    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter-re/epoch_40_step_880_final/model.safetensors"
+    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter-re/epoch_38_step_1200/model.safetensors"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
@@ -153,10 +153,10 @@ if __name__ == "__main__":
     ERP_WIDTH = 2048
     
     # Seam repair parameters (edge-by-edge)
-    SEAM_WIDTH = 50      # Width of seam region
-    FEATHER = 30         # Feather width for blending
+    SEAM_WIDTH = 70      # Width of seam region
+    FEATHER = 50         # Feather width for blending
     INPAINT_STEPS = 20   # Inpainting steps per edge
-    INPAINT_STRENGTH = 0.55
+    INPAINT_STRENGTH = 0.7
     DEBUG_SEAMS = True   # Save debug images for each edge
     
     # ================================================
