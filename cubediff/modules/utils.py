@@ -1,5 +1,9 @@
 import torch.nn as nn
 import torch
+from ..compat import ensure_torch_xpu_compat
+
+ensure_torch_xpu_compat()
+
 from diffusers import UNet2DConditionModel
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.transformers.transformer_2d import Transformer2DModel
@@ -83,6 +87,31 @@ def load_sliced_unet_weights(unet: UNet2DConditionModel, state_dict: dict) -> No
         print(f"[CubeDiff] Missing keys (expected): {len(missing)} keys")
     if unexpected:
         print(f"[CubeDiff] Unexpected keys (ignored): {len(unexpected)} keys")
+
+
+def expand_unet_conv_in(unet: UNet2DConditionModel, in_channels: int = 7) -> None:
+    """
+    Replace UNet conv_in so the network accepts CubeDiff's 7-channel latent input.
+    """
+    old_conv = unet.conv_in
+    if old_conv.in_channels == in_channels:
+        return
+
+    new_conv = nn.Conv2d(
+        in_channels=in_channels,
+        out_channels=old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=old_conv.bias is not None,
+    )
+    with torch.no_grad():
+        new_conv.weight.zero_()
+        copy_channels = min(old_conv.in_channels, in_channels)
+        new_conv.weight[:, :copy_channels].copy_(old_conv.weight[:, :copy_channels])
+        if old_conv.bias is not None and new_conv.bias is not None:
+            new_conv.bias.copy_(old_conv.bias)
+    unet.conv_in = new_conv
 
 
 def patch_unet(unet: UNet2DConditionModel) -> UNet2DConditionModel:

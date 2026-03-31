@@ -140,11 +140,11 @@ if __name__ == "__main__":
     # Option A: original CubeDiff pretrained weights
     # CUBEDIFF_WEIGHTS = "./models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
     # Option B: your fine-tuned checkpoint (uncomment and set path)
-    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter-re/epoch_38_step_1200/model.safetensors"
+    CUBEDIFF_WEIGHTS = "./checkpoints/polydiff-multitext-ipadapter-1000/epoch_40_step_2500/model.safetensors"
     
     # Output directory
     IMAGE_NAME = os.path.splitext(os.path.basename(IMAGE_FILENAME))[0]
-    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_v2_ip/"
+    OUTPUT_DIR = f"output/{IMAGE_NAME}_polydiff_v2_ip-1000/"
     
     # Generation parameters
     CFG_SCALE = 3.5

@@ -5,10 +5,14 @@ import torch
 import numpy as np
 from tqdm.auto import tqdm
 
+from ..compat import ensure_torch_xpu_compat
+
+ensure_torch_xpu_compat()
+
 from diffusers import StableDiffusionPipeline
 from diffusers.pipelines.stable_diffusion.pipeline_output import BaseOutput
 from diffusers.image_processor import PipelineImageInput
-from ..modules.extra_channels import get_uv_tensors
+from ..modules.extra_channels import get_uv_tensors, make_extra_channels_tensor
 from ..modules.utils import patch_groupnorm, patch_unet, swap_transformer_blocks, load_sliced_unet_weights
 from .postprocessing import postprocess_outputs
 from dataclasses import dataclass
@@ -325,8 +329,13 @@ class CubeDiffPipeline(StableDiffusionPipeline):
         for i, t in enumerate(progress_bar):
             latents[0] = ref_lat  # keep front face fixed
             latents_scaled = self.scheduler.scale_model_input(latents, t)
-            # Pure 4-channel latent input (no extra channels concatenation)
-            latents_input = latents_scaled
+            if self.unet.conv_in.weight.shape[1] == 7:
+                extra_channels = make_extra_channels_tensor(1, sample_size, sample_size).to(
+                    device=device, dtype=self.unet.dtype
+                )
+                latents_input = torch.cat([latents_scaled, extra_channels], dim=1)
+            else:
+                latents_input = latents_scaled
 
             # 4. Conditional Forward (with cond IP-Adapter embeds)
             iter_kwargs = cross_attention_kwargs.copy()

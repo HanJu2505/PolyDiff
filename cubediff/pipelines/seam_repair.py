@@ -227,16 +227,29 @@ def project_faces_to_seam_view(face_a: np.ndarray, face_b: np.ndarray,
     
     for face_idx, face_img in [(face_a_idx, face_a), (face_b_idx, face_b)]:
         px, py, valid = project_to_cubemap_face(wx, wy, wz, face_idx, face_size)
-        
-        px_int = np.clip(px.astype(np.int32), 0, face_size - 1)
-        py_int = np.clip(py.astype(np.int32), 0, face_size - 1)
-        
-        # Sample from face
+
+        safe_index_mask = (
+            valid
+            & np.isfinite(px)
+            & np.isfinite(py)
+            & (px >= 0)
+            & (px < face_size)
+            & (py >= 0)
+            & (py < face_size)
+        )
+
+        px_int = np.zeros_like(px, dtype=np.int32)
+        py_int = np.zeros_like(py, dtype=np.int32)
+        if np.any(safe_index_mask):
+            px_int[safe_index_mask] = px[safe_index_mask].astype(np.int32)
+            py_int[safe_index_mask] = py[safe_index_mask].astype(np.int32)
+
+        # Sample from face (invalid indices stay at 0 and are later masked out)
         sampled = face_img[py_int, px_int]
-        
+
         # Only write valid pixels (first face takes priority in overlap)
-        mask = valid & (output.sum(axis=-1) == 0)  # Only write if not already filled
-        output = np.where(mask[..., None], sampled, output)
+        write_mask = safe_index_mask & (output.sum(axis=-1) == 0)
+        output = np.where(write_mask[..., None], sampled, output)
     
     return output
 
@@ -320,17 +333,35 @@ def paste_back_to_face(seam_view: np.ndarray,
     # Unrotate to seam camera coordinates
     cx, cy, cz = unrotate_vector(fx, fy, fz, yaw_rad, pitch_rad)
     
-    # Project to seam camera image plane
-    valid = cz > 0
+    # Project to seam camera image plane.
+    # Use a small epsilon and masked division so invalid pixels never generate inf/nan.
+    eps = 1e-8
+    valid = cz > eps
     half_fov = np.tan(np.radians(fov_deg / 2))
-    
-    seam_u = (cx / cz / half_fov) * (seam_size / 2) + seam_size / 2
-    seam_v = (-cy / cz / half_fov) * (seam_size / 2) + seam_size / 2
-    
-    valid = valid & (seam_u >= 0) & (seam_u < seam_size) & (seam_v >= 0) & (seam_v < seam_size)
-    
-    seam_u_int = np.clip(seam_u.astype(np.int32), 0, seam_size - 1)
-    seam_v_int = np.clip(seam_v.astype(np.int32), 0, seam_size - 1)
+
+    seam_u = np.zeros_like(cx, dtype=np.float64)
+    seam_v = np.zeros_like(cy, dtype=np.float64)
+    np.divide(cx, cz, out=seam_u, where=valid)
+    np.divide(-cy, cz, out=seam_v, where=valid)
+
+    seam_u = (seam_u / half_fov) * (seam_size / 2) + seam_size / 2
+    seam_v = (seam_v / half_fov) * (seam_size / 2) + seam_size / 2
+
+    safe_index_mask = (
+        valid
+        & np.isfinite(seam_u)
+        & np.isfinite(seam_v)
+        & (seam_u >= 0)
+        & (seam_u < seam_size)
+        & (seam_v >= 0)
+        & (seam_v < seam_size)
+    )
+
+    seam_u_int = np.zeros_like(seam_u, dtype=np.int32)
+    seam_v_int = np.zeros_like(seam_v, dtype=np.int32)
+    if np.any(safe_index_mask):
+        seam_u_int[safe_index_mask] = seam_u[safe_index_mask].astype(np.int32)
+        seam_v_int[safe_index_mask] = seam_v[safe_index_mask].astype(np.int32)
     
     # Sample from seam view
     sampled = seam_view[seam_v_int, seam_u_int]
@@ -338,7 +369,7 @@ def paste_back_to_face(seam_view: np.ndarray,
     
     # Blend with original
     result = original_face.copy().astype(np.float32)
-    alpha = (sampled_mask * valid)[..., None]
+    alpha = (sampled_mask * safe_index_mask.astype(sampled_mask.dtype))[..., None]
     result = result * (1 - alpha) + sampled.astype(np.float32) * alpha
     
     return result.astype(np.uint8)

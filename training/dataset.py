@@ -357,7 +357,7 @@ class PreExtractedCubemapDataset(Dataset):
         
         print(f"[INFO] PreExtractedCubemapDataset: Found {len(self.scene_ids)} scenes")
         print(f"[INFO] Augmentation: {'Enabled (4x)' if augment else 'Disabled'}")
-        print(f"[INFO] IP-Adapter ref images: {'Enabled' if return_ref_images else 'Disabled'}")
+        print(f"[INFO] Reference images returned: {'Enabled' if return_ref_images else 'Disabled'}")
     
     def __len__(self):
         return len(self.scene_ids)
@@ -440,4 +440,3 @@ def preextracted_cubemap_collate_fn(batch):
     single_captions = [item[4] for item in batch]
     
     return cubemaps, prompts, ref_images, scene_ids, single_captions
-

@@ -1,0 +1,64 @@
+# Configuration for training with pre-extracted cubemaps + appearance-only conditioning
+defaults:
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+name: "polydiff-multitext-appearance"
+
+training:
+  seed: 42
+  epochs: 40
+  batch_size: 16
+  per_gpu_batch_size: 1
+  learning_rate: 1e-4
+  betas: [0.9, 0.999]
+  eps: 1e-8
+  warmup_steps: 100
+  num_workers: 4
+  num_gpus: 1
+  use_checkpointing: true
+  mixed_precision: "fp16"
+  checkpoint_interval_type: "steps"
+  checkpoint_interval: 100
+  validation_interval: 50
+  prediction_type: "epsilon"
+  type: "multitext"
+  resume_checkpoint: false
+  resume_checkpoint_filename: ""
+  max_train_steps: 0
+  use_preextracted: true
+  augment: true
+  cubediff_weights: "/home/dell/code/PolyDiff/models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
+
+model:
+  id: "runwayml/stable-diffusion-v1-5"
+  image_size: 512
+
+directories:
+  checkpoint_dir: "./checkpoints/polydiff-multitext-appearance"
+  cache_dir: "~/.cache/huggingface/hub"
+  cubemap_dir: "/home/dell/Datasets/PolyDiff/TrainCubeMaps"
+  prompt_dir: "/home/dell/Datasets/PolyDiff/TrainPrompts"
+  data_dir: "/home/dell/Datasets/PolyDiff/TrainERP"
+
+swanlab:
+  enabled: true
+  project_name: "polydiff-training"
+  use_cloud: true
+
+appearance:
+  num_tokens: 4
+  token_dim: 768
+  global_dim: 512
+  texture_dim: 128
+  fusion_dim: 512
+  base_scale: 0.3
+  layer_scales:
+    shallow: 1.0
+    mid: 0.7
+    deep: 0.4
+  loss:
+    weight: 0.05
+    lambda_color: 1.0
+    lambda_luma: 0.2
+    lambda_feat: 0.5

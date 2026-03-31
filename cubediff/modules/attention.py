@@ -1,7 +1,8 @@
-import torch
 import math
-from typing import Optional, Dict, Any
-from einops import rearrange
+from typing import Any, Dict, Optional
+
+import torch
+import torch.nn as nn
 from diffusers.models.attention import BasicTransformerBlock
 from diffusers.models.attention import Attention
 from diffusers.utils import deprecate
@@ -314,6 +315,117 @@ class CubeDiffIPAdapterAttnProcessor:
         return hidden_states
 
 
+class CubeDiffAppearanceAttnProcessor(nn.Module):
+    """
+    Cross-attention processor with a dedicated appearance branch:
+
+        output = text_attention + scale * appearance_attention
+
+    Appearance tokens are projected with their own K/V layers so the branch can
+    specialize without hijacking the text branch.
+    """
+
+    def __init__(self, hidden_size: int, cross_attention_dim: int, scale: float = 1.0):
+        super().__init__()
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError("CubeDiffAppearanceAttnProcessor requires PyTorch 2.0+")
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.scale = float(scale)
+        self.to_k_app = nn.Linear(cross_attention_dim, hidden_size, bias=False)
+        self.to_v_app = nn.Linear(cross_attention_dim, hidden_size, bias=False)
+
+    def initialize_from_attention(self, attn: Attention) -> None:
+        with torch.no_grad():
+            self.to_k_app.weight.copy_(attn.to_k.weight)
+            self.to_v_app.weight.copy_(attn.to_v.weight)
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        appearance_tokens: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        if len(args) > 0 or kwargs.get("scale", None) is not None:
+            deprecation_message = "The `scale` argument is deprecated and will be ignored."
+            deprecate("scale", "1.0.0", deprecation_message)
+
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size = hidden_states.shape[0]
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        else:
+            if isinstance(encoder_hidden_states, tuple):
+                encoder_hidden_states = encoder_hidden_states[0]
+            if attn.norm_cross:
+                encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+        if appearance_tokens is not None:
+            app_key = self.to_k_app(appearance_tokens)
+            app_value = self.to_v_app(appearance_tokens)
+            app_key = app_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+            app_value = app_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+            if attn.norm_k is not None:
+                app_key = attn.norm_k(app_key)
+
+            app_hidden = F.scaled_dot_product_attention(
+                query, app_key, app_value, attn_mask=None, dropout_p=0.0, is_causal=False
+            )
+            hidden_states = hidden_states + self.scale * app_hidden
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
+
+
 class CubeDiffTransformerBlock(BasicTransformerBlock):
 
     def __init__(self, *args, **kwargs):
@@ -374,7 +486,7 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         uv_coords = cross_attention_kwargs.get("uv_coords", None)
 
         # reshape to attend to all faces
-        norm_hidden_states = rearrange(norm_hidden_states, "(b t) (hw) c -> b (t hw) c", b=B, t=T, hw=hw)
+        norm_hidden_states = norm_hidden_states.reshape(B, T, hw, -1).reshape(B, T * hw, -1)
 
         front_face_drop = cross_attention_kwargs.pop("front_face_drop", False)
 
@@ -392,8 +504,11 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
             self_attention_mask = None
 
         # Build kwargs for attn1 — pass uv_coords for PE injection
-        attn1_kwargs = {k: v for k, v in cross_attention_kwargs.items() 
-                        if k not in ("uv_coords", "front_face_drop")}
+        attn1_kwargs = {
+            k: v
+            for k, v in cross_attention_kwargs.items()
+            if k not in ("uv_coords", "front_face_drop", "appearance_tokens")
+        }
         attn1_kwargs["uv_coords"] = uv_coords
 
         attn_output = self.attn1(
@@ -407,7 +522,7 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
         del self_attention_mask
  
         # reshape back to (B*T, C, H, W) post attention
-        attn_output = rearrange(attn_output, "b (t hw) c -> (b t) (hw) c", b=B, t=T, hw=hw)
+        attn_output = attn_output.reshape(B, T, hw, -1).reshape(B * T, hw, -1)
 
         if self.norm_type == "ada_norm_zero":
             attn_output = gate_msa.unsqueeze(1) * attn_output
@@ -442,8 +557,11 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
                 norm_hidden_states = self.pos_embed(norm_hidden_states)
 
             # Build clean kwargs for attn2 — exclude uv_coords (not needed for cross-attention)
-            attn2_kwargs = {k: v for k, v in cross_attention_kwargs.items() 
-                           if k not in ("uv_coords", "front_face_drop")}
+            attn2_kwargs = {
+                k: v
+                for k, v in cross_attention_kwargs.items()
+                if k not in ("uv_coords", "front_face_drop")
+            }
 
             attn_output = self.attn2(
                 norm_hidden_states,
@@ -485,3 +603,42 @@ class CubeDiffTransformerBlock(BasicTransformerBlock):
             hidden_states = hidden_states.squeeze(1)
 
         return hidden_states
+
+
+def _resolve_layer_scale(module_name: str, layer_scales: Dict[str, float]) -> float:
+    if module_name.startswith("down_blocks.0") or module_name.startswith("down_blocks.1"):
+        return layer_scales["shallow"]
+    if module_name.startswith("up_blocks.2") or module_name.startswith("up_blocks.3"):
+        return layer_scales["shallow"]
+    if module_name.startswith("down_blocks.2") or module_name.startswith("up_blocks.1"):
+        return layer_scales["mid"]
+    if module_name.startswith("down_blocks.3") or module_name.startswith("up_blocks.0"):
+        return layer_scales["deep"]
+    if module_name.startswith("mid_block"):
+        return layer_scales["deep"]
+    return layer_scales["mid"]
+
+
+def install_appearance_processors(
+    unet: nn.Module,
+    *,
+    base_scale: float = 0.3,
+    layer_scales: Optional[Dict[str, float]] = None,
+) -> None:
+    if layer_scales is None:
+        layer_scales = {"shallow": 1.0, "mid": 0.7, "deep": 0.4}
+
+    for module_name, module in unet.named_modules():
+        if not hasattr(module, "attn2") or module.attn2 is None:
+            continue
+
+        attn2 = module.attn2
+        hidden_size = attn2.inner_dim
+        cross_attention_dim = attn2.cross_attention_dim or hidden_size
+        processor = CubeDiffAppearanceAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            scale=base_scale * _resolve_layer_scale(module_name, layer_scales),
+        )
+        processor.initialize_from_attention(attn2)
+        attn2.set_processor(processor)
