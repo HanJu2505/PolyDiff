@@ -37,7 +37,6 @@ from cubediff.modules.appearance import (
 )
 from cubediff.modules.attention import install_appearance_processors
 from cubediff.modules.extra_channels import make_extra_channels_tensor, get_uv_tensors
-from cubediff.modules.utils import expand_unet_conv_in
 from cubediff.pipelines.pipeline import CubeDiffPipeline
 from training.dataset import (
     CubemapDataset,
@@ -72,6 +71,17 @@ def load_full_cubediff_unet_weights(unet: nn.Module, ckpt_path: str) -> None:
     if conv_weight is None or conv_weight.shape[1] != 7:
         raise ValueError(
             f"Expected a 7-channel CubeDiff checkpoint, got conv_in.weight={None if conv_weight is None else tuple(conv_weight.shape)}"
+        )
+
+    if unet.conv_in.in_channels != conv_weight.shape[1]:
+        old_conv = unet.conv_in
+        unet.conv_in = nn.Conv2d(
+            in_channels=conv_weight.shape[1],
+            out_channels=old_conv.out_channels,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
         )
 
     missing, unexpected = unet.load_state_dict(state_dict, strict=False)
@@ -160,7 +170,6 @@ def main(cfg: DictConfig):
         pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
-    expand_unet_conv_in(pipe.unet, in_channels=7)
     load_full_cubediff_unet_weights(pipe.unet, os.path.expanduser(cfg.training.cubediff_weights))
     install_appearance_processors(
         pipe.unet,
@@ -386,6 +395,8 @@ def main(cfg: DictConfig):
 
                     appearance_out = appearance_conditioner(front_images)
                     appearance_tokens = flatten_face_tokens(appearance_out.face_tokens)
+                    appearance_keep = (~mask).repeat_interleave(T).view(B * T, 1, 1).to(dtype=appearance_tokens.dtype)
+                    appearance_tokens = appearance_tokens * appearance_keep
 
                     latents[non_front_mask] = pipe.scheduler.add_noise(
                         latents[non_front_mask], noise, timesteps[non_front_mask]
@@ -429,6 +440,10 @@ def main(cfg: DictConfig):
                         "luma": denoise_loss.new_tensor(0.0),
                         "feat": denoise_loss.new_tensor(0.0),
                     }
+                    app_loss_weight = float(cfg.appearance.loss.weight)
+                    lambda_color = float(cfg.appearance.loss.lambda_color)
+                    lambda_luma = float(cfg.appearance.loss.lambda_luma)
+                    lambda_feat = float(cfg.appearance.loss.lambda_feat)
                     for face_idx, face_name in enumerate(NON_FRONT_FACE_ORDER):
                         face_weight = float(FACE_WEIGHTS[face_name])
                         face_latents = pred_x0_faces[:, face_idx]
@@ -443,15 +458,15 @@ def main(cfg: DictConfig):
                             sigma=lowpass_sigma,
                         )
                         weighted_face_loss = face_weight * (
-                            float(cfg.appearance.loss.lambda_color) * terms["color"]
-                            + float(cfg.appearance.loss.lambda_luma) * terms["luma"]
-                            + float(cfg.appearance.loss.lambda_feat) * terms["feat"]
+                            lambda_color * terms["color"]
+                            + lambda_luma * terms["luma"]
+                            + lambda_feat * terms["feat"]
                         )
                         app_loss = app_loss + weighted_face_loss
-                        app_metrics["color"] = app_metrics["color"] + face_weight * terms["color"]
-                        app_metrics["luma"] = app_metrics["luma"] + face_weight * terms["luma"]
-                        app_metrics["feat"] = app_metrics["feat"] + face_weight * terms["feat"]
-                    loss = denoise_loss + float(cfg.appearance.loss.weight) * app_loss
+                        app_metrics["color"] = app_metrics["color"] + app_loss_weight * face_weight * lambda_color * terms["color"]
+                        app_metrics["luma"] = app_metrics["luma"] + app_loss_weight * face_weight * lambda_luma * terms["luma"]
+                        app_metrics["feat"] = app_metrics["feat"] + app_loss_weight * face_weight * lambda_feat * terms["feat"]
+                    loss = denoise_loss + app_loss_weight * app_loss
 
                     total_loss += loss.detach().float()
                     total_denoise_loss += denoise_loss.detach().float()
@@ -625,4 +640,3 @@ if __name__ == "__main__":
     with initialize(config_path="training/configs", version_base=None):
         cfg = compose(config_name=args.config, overrides=overrides)
         main(cfg)
-    swanlab_enabled = bool(getattr(cfg.swanlab, "enabled", True))

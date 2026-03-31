@@ -361,8 +361,8 @@ class CubeDiffPipeline(StableDiffusionPipeline):
                 added_cond_kwargs=added_cond if added_cond else {},
             ).sample
 
-            # 5. Unconditional Forward (with uncond IP-Adapter embeds)
-            iter_uncond_kwargs = cross_attention_kwargs.copy()
+            # 5. Unconditional Forward: drop appearance guidance so CFG acts on both text and appearance.
+            iter_uncond_kwargs = {k: v for k, v in cross_attention_kwargs.items() if k != "appearance_tokens"}
             iter_uncond_kwargs["front_face_drop"] = True  # CubeDiff specific
             iter_uncond_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection
             
