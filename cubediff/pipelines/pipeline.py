@@ -218,7 +218,13 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             cfg_scale: Classifier-free guidance scale
             cross_attention_kwargs: Additional kwargs for cross attention
         """
-        device = self._execution_device
+        # Prefer the live UNet parameter device over `_execution_device`.
+        # During validation we may swap in an unwrapped accelerator model that
+        # already lives on CUDA even if `_execution_device` still reports CPU.
+        try:
+            device = next(self.unet.parameters()).device
+        except StopIteration:
+            device = self._execution_device
         T = 6  # faces
 
         # 1. Process prompts
@@ -340,7 +346,14 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             # 4. Conditional Forward (with cond IP-Adapter embeds)
             iter_kwargs = cross_attention_kwargs.copy()
             iter_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection
-            
+            if "style_cond" in iter_kwargs:
+                if "style_scale" not in iter_kwargs:
+                    raise ValueError("style_cond requires style_scale in cross_attention_kwargs")
+                base_style_scale = iter_kwargs["style_scale"]
+                progress = i / max(1, len(self.scheduler.timesteps) - 1)
+                time_scale = 0.2 if progress < 0.25 else 0.5
+                iter_kwargs["style_scale"] = base_style_scale.to(device=device, dtype=self.unet.dtype) * time_scale
+
             # Prepare added_cond_kwargs with RAW image_embeds (UNet requires this for encoder_hid_dim_type='ip_image_proj')
             # Also pass PROJECTED embeds via cross_attention_kwargs for our decoupled attention processor
             added_cond = {}
@@ -361,8 +374,12 @@ class CubeDiffPipeline(StableDiffusionPipeline):
                 added_cond_kwargs=added_cond if added_cond else {},
             ).sample
 
-            # 5. Unconditional Forward: drop appearance guidance so CFG acts on both text and appearance.
-            iter_uncond_kwargs = {k: v for k, v in cross_attention_kwargs.items() if k != "appearance_tokens"}
+            # 5. Unconditional Forward: drop style guidance so CFG acts on both text and style.
+            iter_uncond_kwargs = {
+                k: v
+                for k, v in cross_attention_kwargs.items()
+                if k not in ("style_cond", "style_scale")
+            }
             iter_uncond_kwargs["front_face_drop"] = True  # CubeDiff specific
             iter_uncond_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection
             

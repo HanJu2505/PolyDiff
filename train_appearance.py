@@ -1,5 +1,5 @@
 """
-CubeDiff training script with appearance-only conditioning.
+CubeDiff training script with front-only global style conditioning.
 
 Usage:
     python train_appearance.py --config multitext_appearance
@@ -9,6 +9,7 @@ import argparse
 import math
 import os
 import time
+from contextlib import nullcontext
 from typing import Dict
 
 import numpy as np
@@ -17,7 +18,6 @@ import torch.nn as nn
 from PIL import Image
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from torch.utils.checkpoint import checkpoint
 
 from cubediff.compat import ensure_torch_xpu_compat
 
@@ -27,16 +27,22 @@ from diffusers import DDIMScheduler
 from diffusers.utils.torch_utils import is_compiled_module
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file as safe_load_file
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from cubediff.modules.appearance import (
-    AppearanceConditioner,
-    appearance_loss_terms,
-    flatten_face_tokens,
+    FACE_ORDER,
+    NON_FRONT_FACE_ORDER,
+    FrontGlobalStyleConditioner,
+    compute_style_loss_terms,
+    expand_style_cond,
+    flatten_style_cond,
+    gaussian_blur_2d,
+    make_style_scale_tensor,
 )
-from cubediff.modules.attention import install_appearance_processors
-from cubediff.modules.extra_channels import make_extra_channels_tensor, get_uv_tensors
+from cubediff.modules.attention import install_global_style_processors, install_trainable_attn1_processors
+from cubediff.modules.extra_channels import get_uv_tensors, make_extra_channels_tensor
 from cubediff.pipelines.pipeline import CubeDiffPipeline
 from training.dataset import (
     CubemapDataset,
@@ -46,9 +52,14 @@ from training.dataset import (
 )
 
 
-FACE_WEIGHTS = {"left": 1.0, "right": 1.0, "top": 0.6, "bottom": 0.6, "back": 0.2}
-FACE_SCALES = {"front": 0.0, "back": 0.25, "left": 1.0, "right": 1.0, "top": 0.5, "bottom": 0.5}
-NON_FRONT_FACE_ORDER = ["back", "left", "right", "top", "bottom"]
+DEFAULT_FACE_SCALES = {
+    "front": 0.90,
+    "back": 0.15,
+    "left": 0.45,
+    "right": 0.45,
+    "top": 0.10,
+    "bottom": 0.10,
+}
 
 
 def load_state_dict(path: str) -> Dict[str, torch.Tensor]:
@@ -115,7 +126,7 @@ def get_lowpass_params(image_size: int):
         return 21, 5.0
     if image_size == 768:
         return 31, 7.5
-    raise ValueError(f"Unsupported image_size for appearance conditioning: {image_size}")
+    raise ValueError(f"Unsupported image_size for style conditioning: {image_size}")
 
 
 def decode_latents_with_checkpoint(vae, latents: torch.Tensor, scaling_factor: float) -> torch.Tensor:
@@ -125,6 +136,52 @@ def decode_latents_with_checkpoint(vae, latents: torch.Tensor, scaling_factor: f
         return vae.decode(z).sample
 
     return checkpoint(_decode, scaled_latents, use_reentrant=False)
+
+
+def get_front_prompts(prompts: list[str], batch_size: int, num_faces: int) -> list[str]:
+    if len(prompts) != batch_size * num_faces:
+        raise ValueError(f"Expected {batch_size * num_faces} prompts, got {len(prompts)}")
+    return [prompts[i * num_faces] for i in range(batch_size)]
+
+
+def build_sd_prompts(
+    *,
+    prompts: list[str],
+    single_captions: list[str],
+    drop_mask: torch.Tensor,
+    training_type: str,
+    num_faces: int,
+) -> list[str]:
+    full_mask = drop_mask.repeat_interleave(num_faces).tolist()
+    if training_type == "image_only":
+        return [""] * len(prompts)
+    if training_type == "single_caption":
+        output = []
+        for index, caption in enumerate(single_captions):
+            value = "" if bool(drop_mask[index]) else caption
+            output.extend([value] * num_faces)
+        return output
+    return [prompt if not dropped else "" for prompt, dropped in zip(prompts, full_mask)]
+
+
+def resolve_time_scale(timesteps_b: torch.Tensor, scheduler: DDIMScheduler, split: float, early: float, late: float) -> torch.Tensor:
+    max_t = max(1, scheduler.config.num_train_timesteps - 1)
+    progress = 1.0 - timesteps_b.float() / max_t
+    return torch.where(progress < split, progress.new_full((), early), progress.new_full((), late))
+
+
+def freeze_and_select_trainable_params(unet: nn.Module) -> None:
+    for param in unet.parameters():
+        param.requires_grad = False
+
+    for name, param in unet.named_parameters():
+        if ".attn1.processor." in name or ".attn1.to_q." in name or ".attn1.to_k." in name:
+            param.requires_grad = True
+        if name.startswith("up_blocks.1") and ".attn2.processor." in name:
+            param.requires_grad = True
+
+    for param in unet.conv_in.parameters():
+        param.requires_grad = False
 
 
 def main(cfg: DictConfig):
@@ -170,16 +227,10 @@ def main(cfg: DictConfig):
         pipe.vae.enable_slicing()
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
+
     load_full_cubediff_unet_weights(pipe.unet, os.path.expanduser(cfg.training.cubediff_weights))
-    install_appearance_processors(
-        pipe.unet,
-        base_scale=float(cfg.appearance.base_scale),
-        layer_scales={
-            "shallow": float(cfg.appearance.layer_scales.shallow),
-            "mid": float(cfg.appearance.layer_scales.mid),
-            "deep": float(cfg.appearance.layer_scales.deep),
-        },
-    )
+    install_trainable_attn1_processors(pipe.unet)
+    install_global_style_processors(pipe.unet, module_prefix=str(cfg.appearance.style_block))
 
     if cfg.training.prediction_type == "v_prediction":
         pipe.scheduler = DDIMScheduler.from_pretrained(
@@ -202,24 +253,15 @@ def main(cfg: DictConfig):
         param.requires_grad = False
     for param in pipe.text_encoder.parameters():
         param.requires_grad = False
-    for param in pipe.unet.parameters():
-        param.requires_grad = False
-    for name, param in pipe.unet.named_parameters():
-        if "attn" in name:
-            param.requires_grad = True
-    for param in pipe.unet.conv_in.parameters():
-        param.requires_grad = False
+    freeze_and_select_trainable_params(pipe.unet)
 
     lowpass_kernel, lowpass_sigma = get_lowpass_params(cfg.model.image_size)
-    appearance_conditioner = AppearanceConditioner(
-        lowpass_kernel=lowpass_kernel,
-        lowpass_sigma=lowpass_sigma,
-        global_dim=int(cfg.appearance.global_dim),
-        texture_dim=int(cfg.appearance.texture_dim),
-        fusion_dim=int(cfg.appearance.fusion_dim),
-        num_tokens=int(cfg.appearance.num_tokens),
-        token_dim=int(cfg.appearance.token_dim),
-        face_scales=FACE_SCALES,
+    appearance_conditioner = FrontGlobalStyleConditioner(
+        clip_model_id=str(cfg.appearance.clip_model_id),
+        style_dim=int(cfg.appearance.style_dim),
+        beta=float(cfg.appearance.beta),
+        cache_dir=cache_dir,
+        local_files_only=bool(getattr(cfg.appearance, "local_files_only", False)),
     )
 
     use_preextracted = getattr(cfg.training, "use_preextracted", False)
@@ -261,7 +303,7 @@ def main(cfg: DictConfig):
         collate_fn=collate_fn,
         num_workers=cfg.training.num_workers,
         pin_memory=True,
-        persistent_workers=True,
+        persistent_workers=cfg.training.num_workers > 0,
         drop_last=True,
     )
 
@@ -288,7 +330,6 @@ def main(cfg: DictConfig):
         return min_ratio + (1.0 - min_ratio) * cosine_decay
 
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda_cosine)
-
     unet, appearance_conditioner, optimizer, dataloader = accelerator.prepare(
         pipe.unet, appearance_conditioner, optimizer, dataloader
     )
@@ -301,6 +342,7 @@ def main(cfg: DictConfig):
 
     pipe.vae.to(accelerator.device, dtype=weight_dtype)
     pipe.text_encoder.to(accelerator.device, dtype=weight_dtype)
+    unwrap_model(appearance_conditioner).move_backbone(device=accelerator.device, dtype=weight_dtype)
 
     global_step = 0
     start_epoch = 0
@@ -314,16 +356,27 @@ def main(cfg: DictConfig):
 
     checkpoint_dir = cfg.directories.checkpoint_dir
     os.makedirs(checkpoint_dir, exist_ok=True)
-    step_start_time = time.time()
     epochs = cfg.training.epochs
-    T = 6
+    step_start_time = time.time()
+    num_faces = len(FACE_ORDER)
     max_train_steps = int(getattr(cfg.training, "max_train_steps", 0) or 0)
+    lambda_style = float(cfg.appearance.loss.weight)
+    lambda_color = float(cfg.appearance.loss.lambda_color)
+    lambda_luma = float(cfg.appearance.loss.lambda_luma)
+    time_split = float(cfg.appearance.time_schedule.split)
+    time_early = float(cfg.appearance.time_schedule.early)
+    time_late = float(cfg.appearance.time_schedule.late)
+    face_scales = {
+        name: float(getattr(cfg.appearance.face_scales, name, DEFAULT_FACE_SCALES[name]))
+        for name in FACE_ORDER
+    }
+    style_loss_weights = {name: face_scales[name] for name in NON_FRONT_FACE_ORDER}
 
     if accelerator.is_main_process:
-        trainable_count = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-        appearance_count = sum(p.numel() for p in appearance_conditioner.parameters() if p.requires_grad)
-        print(f"[INFO] Trainable UNet params: {trainable_count:,}")
-        print(f"[INFO] Trainable appearance params: {appearance_count:,}")
+        trainable_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        trainable_style = sum(p.numel() for p in appearance_conditioner.parameters() if p.requires_grad)
+        print(f"[INFO] Trainable UNet params: {trainable_unet:,}")
+        print(f"[INFO] Trainable appearance params: {trainable_style:,}")
 
     for epoch in range(start_epoch, epochs):
         unet.train()
@@ -331,10 +384,9 @@ def main(cfg: DictConfig):
         optimizer.zero_grad()
         total_loss = 0.0
         total_denoise_loss = 0.0
-        total_app_loss = 0.0
+        total_style_loss = 0.0
         total_color_loss = 0.0
         total_luma_loss = 0.0
-        total_feat_loss = 0.0
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", disable=not accelerator.is_main_process)
         for _, batch in enumerate(progress_bar):
@@ -343,69 +395,93 @@ def main(cfg: DictConfig):
             if batch is None:
                 continue
 
-            if use_preextracted:
-                cubemap_batch, prompts, _, scene_ids, single_captions = batch
-            else:
-                cubemap_batch, prompts, _, scene_ids, single_captions = batch
-
+            cubemap_batch, prompts, _, scene_ids, single_captions = batch
             cubemap_batch = cubemap_batch.to(accelerator.device)
+
             with accelerator.accumulate(unet):
-                with accelerator.autocast():
+                autocast_context = (
+                    accelerator.autocast()
+                    if accelerator.device.type == "cuda"
+                    else nullcontext()
+                )
+                with autocast_context:
                     with torch.no_grad():
                         latents = pipe.vae.encode(cubemap_batch).latent_dist.mean
                         latents = latents * pipe.vae.config.scaling_factor
 
-                        B = latents.shape[0] // T
-                        _, _, H, W = latents.shape
-                        cubemap_faces = cubemap_batch.view(B, T, 3, cubemap_batch.shape[-2], cubemap_batch.shape[-1])
+                        batch_size = latents.shape[0] // num_faces
+                        _, _, height, width = latents.shape
+                        cubemap_faces = cubemap_batch.view(batch_size, num_faces, 3, cubemap_batch.shape[-2], cubemap_batch.shape[-1])
                         front_images = cubemap_faces[:, 0]
+                        front_prompts = get_front_prompts(prompts, batch_size, num_faces)
 
-                        mask = torch.rand(B, device=accelerator.device) < 0.1
-                        full_mask = mask.repeat_interleave(T)
-                        full_mask_list = full_mask.tolist()
-                        prompts = [p if not dropped else "" for p, dropped in zip(prompts, full_mask_list)]
-
-                        if cfg.training.type == "image_only":
-                            prompts = [""] * len(prompts)
-                        elif cfg.training.type == "single_caption":
-                            prompts = []
-                            for i, sc in enumerate(single_captions):
-                                prompts.extend(["" if full_mask_list[i * T] else sc] * T)
+                        drop_mask = torch.rand(batch_size, device=accelerator.device) < 0.1
+                        sd_prompts = build_sd_prompts(
+                            prompts=prompts,
+                            single_captions=single_captions,
+                            drop_mask=drop_mask,
+                            training_type=str(cfg.training.type),
+                            num_faces=num_faces,
+                        )
 
                         text_inputs = pipe.tokenizer(
-                            prompts, padding="max_length", truncation=True, max_length=77, return_tensors="pt"
+                            sd_prompts,
+                            padding="max_length",
+                            truncation=True,
+                            max_length=77,
+                            return_tensors="pt",
                         )
                         encoder_hidden_states = pipe.text_encoder(text_inputs.input_ids.to(accelerator.device))[0]
 
-                        timesteps = torch.randint(
+                        timesteps_b = torch.randint(
                             0,
                             pipe.scheduler.config.num_train_timesteps,
-                            (B,),
+                            (batch_size,),
                             device=latents.device,
                             dtype=torch.long,
                         )
-                        timesteps = timesteps.repeat_interleave(T)
+                        timesteps = timesteps_b.repeat_interleave(num_faces)
 
-                        face_indices = torch.arange(B * T, device=latents.device)
-                        face_ids = face_indices % T
+                        face_indices = torch.arange(batch_size * num_faces, device=latents.device)
+                        face_ids = face_indices % num_faces
                         non_front_mask = face_ids != 0
 
                         noise = torch.randn_like(latents[non_front_mask])
                         orig_latents = latents.clone()
+                        front_low = gaussian_blur_2d(front_images, lowpass_kernel, lowpass_sigma)
 
-                    appearance_out = appearance_conditioner(front_images)
-                    appearance_tokens = flatten_face_tokens(appearance_out.face_tokens)
-                    appearance_keep = (~mask).repeat_interleave(T).view(B * T, 1, 1).to(dtype=appearance_tokens.dtype)
-                    appearance_tokens = appearance_tokens * appearance_keep
+                    style_out = appearance_conditioner(front_images, front_prompts)
+                    style_faces = expand_style_cond(style_out.style_cond)
+                    style_cond = flatten_style_cond(style_faces)
+                    keep_mask = (~drop_mask).repeat_interleave(num_faces).view(batch_size * num_faces, 1, 1).to(style_cond.dtype)
+                    style_cond = style_cond * keep_mask
+
+                    time_scale = resolve_time_scale(
+                        timesteps_b,
+                        pipe.scheduler,
+                        split=time_split,
+                        early=time_early,
+                        late=time_late,
+                    )
+                    style_scale = make_style_scale_tensor(
+                        batch_size,
+                        face_scales=face_scales,
+                        time_scale=time_scale,
+                        device=latents.device,
+                        dtype=latents.dtype,
+                    )
+                    style_scale = style_scale * (~drop_mask).repeat_interleave(num_faces).to(style_scale.dtype)
 
                     latents[non_front_mask] = pipe.scheduler.add_noise(
                         latents[non_front_mask], noise, timesteps[non_front_mask]
                     ).to(latents.dtype)
 
-                    extra_channels = make_extra_channels_tensor(B, H, W).to(latents.device, dtype=latents.dtype)
+                    extra_channels = make_extra_channels_tensor(batch_size, height, width).to(
+                        latents.device, dtype=latents.dtype
+                    )
                     latent_input = torch.cat([latents, extra_channels], dim=1)
-                    uv_coords = get_uv_tensors(B, H, W).to(latents.device, dtype=weight_dtype)
-                    front_face_drop = torch.rand(1, device=accelerator.device) < 0.1
+                    uv_coords = get_uv_tensors(batch_size, height, width).to(latents.device, dtype=weight_dtype)
+                    front_face_drop = bool(torch.rand(1, device=accelerator.device).item() < 0.1)
 
                     model_pred = unet(
                         latent_input,
@@ -414,7 +490,8 @@ def main(cfg: DictConfig):
                         cross_attention_kwargs={
                             "front_face_drop": front_face_drop,
                             "uv_coords": uv_coords,
-                            "appearance_tokens": appearance_tokens,
+                            "style_cond": style_cond,
+                            "style_scale": style_scale,
                         },
                     ).sample
 
@@ -433,47 +510,38 @@ def main(cfg: DictConfig):
                         timesteps[non_front_mask],
                         cfg.training.prediction_type,
                     )
-                    pred_x0_faces = pred_x0.view(B, T - 1, pred_x0.shape[1], pred_x0.shape[2], pred_x0.shape[3])
-                    app_loss = denoise_loss.new_tensor(0.0)
-                    app_metrics = {
+                    pred_x0_faces = pred_x0.view(batch_size, num_faces - 1, pred_x0.shape[1], pred_x0.shape[2], pred_x0.shape[3])
+                    style_loss = denoise_loss.new_tensor(0.0)
+                    style_metrics = {
                         "color": denoise_loss.new_tensor(0.0),
                         "luma": denoise_loss.new_tensor(0.0),
-                        "feat": denoise_loss.new_tensor(0.0),
                     }
-                    app_loss_weight = float(cfg.appearance.loss.weight)
-                    lambda_color = float(cfg.appearance.loss.lambda_color)
-                    lambda_luma = float(cfg.appearance.loss.lambda_luma)
-                    lambda_feat = float(cfg.appearance.loss.lambda_feat)
                     for face_idx, face_name in enumerate(NON_FRONT_FACE_ORDER):
-                        face_weight = float(FACE_WEIGHTS[face_name])
+                        face_weight = float(style_loss_weights[face_name])
                         face_latents = pred_x0_faces[:, face_idx]
                         face_rgb = decode_latents_with_checkpoint(
                             pipe.vae, face_latents, pipe.vae.config.scaling_factor
                         )
-                        terms = appearance_loss_terms(
+                        terms = compute_style_loss_terms(
                             pred_image=face_rgb,
-                            front_low=appearance_out.front_low,
-                            vae=pipe.vae,
+                            front_low=front_low,
                             kernel_size=lowpass_kernel,
                             sigma=lowpass_sigma,
                         )
-                        weighted_face_loss = face_weight * (
-                            lambda_color * terms["color"]
-                            + lambda_luma * terms["luma"]
-                            + lambda_feat * terms["feat"]
+                        face_style = face_weight * (
+                            lambda_color * terms["color"] + lambda_luma * terms["luma"]
                         )
-                        app_loss = app_loss + weighted_face_loss
-                        app_metrics["color"] = app_metrics["color"] + app_loss_weight * face_weight * lambda_color * terms["color"]
-                        app_metrics["luma"] = app_metrics["luma"] + app_loss_weight * face_weight * lambda_luma * terms["luma"]
-                        app_metrics["feat"] = app_metrics["feat"] + app_loss_weight * face_weight * lambda_feat * terms["feat"]
-                    loss = denoise_loss + app_loss_weight * app_loss
+                        style_loss = style_loss + face_style
+                        style_metrics["color"] = style_metrics["color"] + lambda_style * face_weight * lambda_color * terms["color"]
+                        style_metrics["luma"] = style_metrics["luma"] + lambda_style * face_weight * lambda_luma * terms["luma"]
+
+                    loss = denoise_loss + lambda_style * style_loss
 
                     total_loss += loss.detach().float()
                     total_denoise_loss += denoise_loss.detach().float()
-                    total_app_loss += app_loss.detach().float()
-                    total_color_loss += app_metrics["color"].detach().float()
-                    total_luma_loss += app_metrics["luma"].detach().float()
-                    total_feat_loss += app_metrics["feat"].detach().float()
+                    total_style_loss += style_loss.detach().float()
+                    total_color_loss += style_metrics["color"].detach().float()
+                    total_luma_loss += style_metrics["luma"].detach().float()
 
                 accelerator.backward(loss)
 
@@ -499,20 +567,18 @@ def main(cfg: DictConfig):
 
                     avg_loss = gather_metric(total_loss)
                     avg_denoise = gather_metric(total_denoise_loss)
-                    avg_app = gather_metric(total_app_loss)
+                    avg_style = gather_metric(total_style_loss)
                     avg_color = gather_metric(total_color_loss)
                     avg_luma = gather_metric(total_luma_loss)
-                    avg_feat = gather_metric(total_feat_loss)
 
                     total_loss = 0.0
                     total_denoise_loss = 0.0
-                    total_app_loss = 0.0
+                    total_style_loss = 0.0
                     total_color_loss = 0.0
                     total_luma_loss = 0.0
-                    total_feat_loss = 0.0
 
                     if accelerator.is_main_process:
-                        token_norm = appearance_out.shared_tokens.detach().norm(dim=-1).mean().item()
+                        style_norm = style_out.style_cond.detach().norm(dim=-1).mean().item()
                         if swanlab_enabled:
                             import swanlab
 
@@ -520,20 +586,17 @@ def main(cfg: DictConfig):
                                 {
                                     "loss": avg_loss.item(),
                                     "loss_denoise": avg_denoise.item(),
-                                    "loss_app": avg_app.item(),
-                                    "loss_app/color": avg_color.item(),
-                                    "loss_app/luma": avg_luma.item(),
-                                    "loss_app/feat": avg_feat.item(),
-                                    "appearance_token_norm": token_norm,
-                                    "z_global_norm": appearance_out.z_global.detach().norm(dim=-1).mean().item(),
-                                    "z_texture_norm": appearance_out.z_texture.detach().norm(dim=-1).mean().item(),
+                                    "loss_style": avg_style.item(),
+                                    "loss_style/color": avg_color.item(),
+                                    "loss_style/luma": avg_luma.item(),
+                                    "style_cond_norm": style_norm,
                                     "time_per_step": time_elapsed,
                                     "learning_rate": lr_scheduler.get_last_lr()[0],
                                     "grad_norm": grad_norm.item(),
                                 }
                             )
                         progress_bar.set_postfix(
-                            {"loss": f"{avg_loss.item():.4f}", "app": f"{avg_app.item():.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"}
+                            {"loss": f"{avg_loss.item():.4f}", "style": f"{avg_style.item():.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"}
                         )
 
                     if cfg.training.checkpoint_interval_type == "steps" and global_step % cfg.training.checkpoint_interval == 0:
@@ -561,15 +624,31 @@ def main(cfg: DictConfig):
                                 val_prompts_for_gen = val_prompts
 
                             try:
-                                with torch.no_grad(), torch.amp.autocast("cuda", dtype=weight_dtype):
+                                amp_context = (
+                                    torch.amp.autocast(accelerator.device.type, dtype=weight_dtype)
+                                    if accelerator.device.type == "cuda"
+                                    else nullcontext()
+                                )
+                                with torch.no_grad(), amp_context:
                                     val_front = val_conditioning_image.unsqueeze(0)
-                                    val_tokens = flatten_face_tokens(conditioner_eval(val_front).face_tokens)
+                                    val_style = conditioner_eval(val_front, [val_prompts[0]])
+                                    val_style_cond = flatten_style_cond(expand_style_cond(val_style.style_cond))
+                                    val_style_scale = make_style_scale_tensor(
+                                        1,
+                                        face_scales=face_scales,
+                                        time_scale=1.0,
+                                        device=accelerator.device,
+                                        dtype=weight_dtype,
+                                    )
                                     pipeline_output = pipe(
                                         prompts=val_prompts_for_gen,
                                         conditioning_image=val_conditioning_image,
                                         num_inference_steps=30,
                                         cfg_scale=3.5,
-                                        cross_attention_kwargs={"appearance_tokens": val_tokens},
+                                        cross_attention_kwargs={
+                                            "style_cond": val_style_cond,
+                                            "style_scale": val_style_scale,
+                                        },
                                     )
 
                                 pil_equirec = Image.fromarray(pipeline_output.equirectangular)
@@ -593,7 +672,7 @@ def main(cfg: DictConfig):
                                                     os.path.join(val_save_dir, f"step_{global_step}_face_{i}.png"),
                                                     caption=val_prompts[i][:50] if i < len(val_prompts) else "",
                                                 )
-                                                for i in range(6)
+                                                for i in range(num_faces)
                                             ],
                                         }
                                     )
@@ -618,25 +697,16 @@ def main(cfg: DictConfig):
     final_ckpt = os.path.join(checkpoint_dir, f"epoch_{epochs}_step_{global_step}_final")
     accelerator.save_state(final_ckpt)
     accelerator.wait_for_everyone()
-
     if accelerator.is_main_process:
         print(f"[INFO] Final checkpoint saved: {final_ckpt}")
-        if swanlab_enabled:
-            import swanlab
-
-            swanlab.finish()
 
 
 if __name__ == "__main__":
-    os.environ["NCCL_TIMEOUT"] = "3600"
-    os.environ["NCCL_DEBUG"] = "INFO"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="multitext_appearance")
+    args = parser.parse_args()
 
-    parser = argparse.ArgumentParser(description="Train CubeDiff with appearance-only conditioning")
-    parser.add_argument("--config", type=str, default="multitext_appearance", help="Name of the Hydra config to use")
-    args, overrides = parser.parse_known_args()
-
-    from hydra import compose, initialize
-
-    with initialize(config_path="training/configs", version_base=None):
-        cfg = compose(config_name=args.config, overrides=overrides)
-        main(cfg)
+    config_name = args.config.replace(".yaml", "")
+    config_path = os.path.join("training", "configs", f"{config_name}.yaml")
+    cfg = OmegaConf.load(config_path)
+    main(cfg)

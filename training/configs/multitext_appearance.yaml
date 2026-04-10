@@ -7,7 +7,7 @@ name: "polydiff-multitext-appearance"
 
 training:
   seed: 42
-  epochs: 40
+  epochs: 1
   batch_size: 16
   per_gpu_batch_size: 1
   learning_rate: 1e-4
@@ -20,7 +20,7 @@ training:
   mixed_precision: "fp16"
   checkpoint_interval_type: "steps"
   checkpoint_interval: 100
-  validation_interval: 50
+  validation_interval: 2
   prediction_type: "epsilon"
   type: "multitext"
   resume_checkpoint: false
@@ -47,18 +47,23 @@ swanlab:
   use_cloud: true
 
 appearance:
-  num_tokens: 4
-  token_dim: 768
-  global_dim: 512
-  texture_dim: 128
-  fusion_dim: 512
-  base_scale: 0.3
-  layer_scales:
-    shallow: 1.0
-    mid: 0.7
-    deep: 0.4
+  clip_model_id: "openai/clip-vit-large-patch14"
+  local_files_only: false
+  beta: 0.6
+  style_dim: 768
+  style_block: "up_blocks.1"
+  face_scales:
+    front: 0.90
+    left: 0.45
+    right: 0.45
+    back: 0.15
+    top: 0.10
+    bottom: 0.10
+  time_schedule:
+    split: 0.25
+    early: 0.2
+    late: 0.5
   loss:
     weight: 0.05
     lambda_color: 1.0
-    lambda_luma: 0.2
-    lambda_feat: 0.5
+    lambda_luma: 0.3

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers import CLIPModel, CLIPProcessor
 
 
 FACE_ORDER = ["front", "back", "left", "right", "top", "bottom"]
@@ -27,216 +28,10 @@ def gaussian_blur_2d(images: torch.Tensor, kernel_size: int, sigma: float) -> to
         raise ValueError(f"kernel_size must be odd, got {kernel_size}")
 
     kernel = _make_gaussian_kernel(kernel_size, sigma, images.device, images.dtype)
-    kernel = kernel.view(1, 1, kernel_size, kernel_size)
-    kernel = kernel.repeat(images.shape[1], 1, 1, 1)
+    kernel = kernel.view(1, 1, kernel_size, kernel_size).repeat(images.shape[1], 1, 1, 1)
     padding = kernel_size // 2
     padded = F.pad(images, (padding, padding, padding, padding), mode="reflect")
     return F.conv2d(padded, kernel, groups=images.shape[1])
-
-
-def normalize_high_frequency(hf: torch.Tensor) -> torch.Tensor:
-    mean = hf.mean(dim=(-2, -1), keepdim=True)
-    std = hf.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
-    standardized = (hf - mean) / std
-    return standardized.clamp(-3.0, 3.0) / 3.0
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1),
-            nn.GroupNorm(8, out_channels),
-            nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(8, out_channels),
-            nn.SiLU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class GlobalAppearanceEncoder(nn.Module):
-    def __init__(self, output_dim: int = 512):
-        super().__init__()
-        self.stem = ConvBlock(3, 32, stride=1)
-        self.stage2 = ConvBlock(32, 64, stride=2)
-        self.stage3 = ConvBlock(64, 128, stride=2)
-        stats_dim = 2 * (32 + 64 + 128)
-        self.proj = nn.Sequential(
-            nn.Linear(stats_dim, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.SiLU(),
-            nn.Linear(output_dim, output_dim),
-        )
-
-    @staticmethod
-    def _stats_pool(feat: torch.Tensor) -> torch.Tensor:
-        mean = feat.mean(dim=(-2, -1))
-        std = feat.std(dim=(-2, -1), unbiased=False)
-        return torch.cat([mean, std], dim=-1)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        f1 = self.stem(x)
-        f2 = self.stage2(f1)
-        f3 = self.stage3(f2)
-        pooled = torch.cat([self._stats_pool(f) for f in (f1, f2, f3)], dim=-1)
-        return self.proj(pooled), [f1, f2, f3]
-
-
-class LocalTextureEncoder(nn.Module):
-    def __init__(self, output_dim: int = 128):
-        super().__init__()
-        self.net = nn.Sequential(
-            ConvBlock(3, 16, stride=1),
-            ConvBlock(16, 32, stride=2),
-            ConvBlock(32, 48, stride=2),
-            ConvBlock(48, 64, stride=2),
-        )
-        self.proj = nn.Sequential(
-            nn.Linear(64, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.SiLU(),
-            nn.Linear(output_dim, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat = self.net(x)
-        pooled = feat.mean(dim=(-2, -1))
-        return self.proj(pooled)
-
-
-class AppearanceFusion(nn.Module):
-    def __init__(self, global_dim: int = 512, texture_dim: int = 128, output_dim: int = 512, texture_weight: float = 0.4):
-        super().__init__()
-        self.texture_weight = texture_weight
-        self.mlp = nn.Sequential(
-            nn.Linear(global_dim + texture_dim, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.SiLU(),
-            nn.Linear(output_dim, output_dim),
-        )
-
-    def forward(self, z_global: torch.Tensor, z_texture: torch.Tensor) -> torch.Tensor:
-        fused = torch.cat([z_global, self.texture_weight * z_texture], dim=-1)
-        return self.mlp(fused)
-
-
-class AppearanceTokenGenerator(nn.Module):
-    def __init__(self, input_dim: int = 512, num_tokens: int = 4, token_dim: int = 768):
-        super().__init__()
-        self.num_tokens = num_tokens
-        self.token_dim = token_dim
-        self.proj = nn.Sequential(
-            nn.Linear(input_dim, input_dim),
-            nn.LayerNorm(input_dim),
-            nn.SiLU(),
-            nn.Linear(input_dim, num_tokens * token_dim),
-        )
-
-    def forward(self, z_app: torch.Tensor) -> torch.Tensor:
-        tokens = self.proj(z_app)
-        return tokens.view(z_app.shape[0], self.num_tokens, self.token_dim)
-
-
-class FaceAwareModulation(nn.Module):
-    def __init__(
-        self,
-        num_tokens: int = 4,
-        token_dim: int = 768,
-        face_scales: Dict[str, float] | None = None,
-    ):
-        super().__init__()
-        self.num_tokens = num_tokens
-        self.token_dim = token_dim
-        self.face_bias = nn.Parameter(torch.zeros(len(FACE_ORDER), num_tokens, token_dim))
-        self.face_gate = nn.Parameter(torch.zeros(len(FACE_ORDER), num_tokens, 1))
-        if face_scales is None:
-            face_scales = {
-                "front": 0.0,
-                "back": 0.25,
-                "left": 1.0,
-                "right": 1.0,
-                "top": 0.5,
-                "bottom": 0.5,
-            }
-        scales = [face_scales[name] for name in FACE_ORDER]
-        self.register_buffer("face_scales", torch.tensor(scales, dtype=torch.float32).view(1, len(FACE_ORDER), 1, 1))
-
-    def forward(self, shared_tokens: torch.Tensor) -> torch.Tensor:
-        tokens = shared_tokens.unsqueeze(1) + self.face_bias.unsqueeze(0)
-        gates = torch.sigmoid(self.face_gate).unsqueeze(0)
-        tokens = tokens * gates * self.face_scales.to(tokens.dtype)
-        return tokens
-
-
-class ContentSuppressionFrontEnd(nn.Module):
-    def __init__(self, kernel_size: int, sigma: float):
-        super().__init__()
-        self.kernel_size = int(kernel_size)
-        self.sigma = float(sigma)
-
-    def forward(self, front_image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        low = gaussian_blur_2d(front_image, self.kernel_size, self.sigma)
-        high = front_image - low
-        high_norm = normalize_high_frequency(high)
-        return low, high_norm
-
-
-@dataclass
-class AppearanceConditioningOutput:
-    front_low: torch.Tensor
-    high_freq_norm: torch.Tensor
-    z_global: torch.Tensor
-    z_texture: torch.Tensor
-    z_app: torch.Tensor
-    shared_tokens: torch.Tensor
-    face_tokens: torch.Tensor
-
-
-class AppearanceConditioner(nn.Module):
-    def __init__(
-        self,
-        *,
-        lowpass_kernel: int = 21,
-        lowpass_sigma: float = 5.0,
-        global_dim: int = 512,
-        texture_dim: int = 128,
-        fusion_dim: int = 512,
-        num_tokens: int = 4,
-        token_dim: int = 768,
-        face_scales: Dict[str, float] | None = None,
-    ):
-        super().__init__()
-        self.frontend = ContentSuppressionFrontEnd(lowpass_kernel, lowpass_sigma)
-        self.global_encoder = GlobalAppearanceEncoder(global_dim)
-        self.texture_encoder = LocalTextureEncoder(texture_dim)
-        self.fusion = AppearanceFusion(global_dim, texture_dim, fusion_dim, texture_weight=0.4)
-        self.token_generator = AppearanceTokenGenerator(fusion_dim, num_tokens, token_dim)
-        self.face_modulation = FaceAwareModulation(num_tokens, token_dim, face_scales=face_scales)
-
-    def forward(self, front_image: torch.Tensor) -> AppearanceConditioningOutput:
-        front_low, high_freq_norm = self.frontend(front_image)
-        z_global, _ = self.global_encoder(front_low)
-        z_texture = self.texture_encoder(high_freq_norm)
-        z_app = self.fusion(z_global, z_texture)
-        shared_tokens = self.token_generator(z_app)
-        face_tokens = self.face_modulation(shared_tokens)
-        return AppearanceConditioningOutput(
-            front_low=front_low,
-            high_freq_norm=high_freq_norm,
-            z_global=z_global,
-            z_texture=z_texture,
-            z_app=z_app,
-            shared_tokens=shared_tokens,
-            face_tokens=face_tokens,
-        )
-
-
-def flatten_face_tokens(face_tokens: torch.Tensor) -> torch.Tensor:
-    bsz, num_faces, num_tokens, token_dim = face_tokens.shape
-    return face_tokens.reshape(bsz * num_faces, num_tokens, token_dim)
 
 
 def per_channel_mean_std(images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -253,20 +48,6 @@ def luminance_mean_std(images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor
     return mean, std
 
 
-def shallow_vae_features(vae: nn.Module, images: torch.Tensor) -> List[torch.Tensor]:
-    encoder = vae.encoder
-    feats = []
-    hidden = encoder.conv_in(images)
-    feats.append(hidden)
-    if hasattr(encoder, "down_blocks"):
-        for block in list(encoder.down_blocks)[:2]:
-            hidden = block(hidden)
-            if isinstance(hidden, tuple):
-                hidden = hidden[0]
-            feats.append(hidden)
-    return feats[:2]
-
-
 def stats_loss(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     src_mean, src_std = per_channel_mean_std(source)
     tgt_mean, tgt_std = per_channel_mean_std(target)
@@ -279,72 +60,162 @@ def luminance_loss(source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(src_mean, tgt_mean) + F.l1_loss(src_std, tgt_std)
 
 
-def feature_stats_loss(vae: nn.Module, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    src_feats = shallow_vae_features(vae, source)
-    tgt_feats = shallow_vae_features(vae, target)
-    loss = source.new_tensor(0.0)
-    for src_feat, tgt_feat in zip(src_feats, tgt_feats):
-        src_mean, src_std = per_channel_mean_std(src_feat)
-        tgt_mean, tgt_std = per_channel_mean_std(tgt_feat)
-        loss = loss + F.l1_loss(src_mean, tgt_mean) + F.l1_loss(src_std, tgt_std)
-    return loss
-
-
-def appearance_loss_terms(
+def compute_style_loss_terms(
     *,
     pred_image: torch.Tensor,
     front_low: torch.Tensor,
-    vae: nn.Module,
     kernel_size: int,
     sigma: float,
 ) -> Dict[str, torch.Tensor]:
     pred_low = gaussian_blur_2d(pred_image, kernel_size, sigma)
-    pred_feat_input = F.interpolate(pred_low, size=(256, 256), mode="bilinear", align_corners=False)
-    front_feat_input = F.interpolate(front_low, size=(256, 256), mode="bilinear", align_corners=False)
     return {
         "color": stats_loss(pred_low, front_low),
         "luma": luminance_loss(pred_low, front_low),
-        "feat": feature_stats_loss(vae, pred_feat_input, front_feat_input),
     }
 
 
-def facewise_appearance_loss(
+def expand_style_cond(style_cond: torch.Tensor) -> torch.Tensor:
+    if style_cond.ndim != 2:
+        raise ValueError(f"Expected style_cond [B, D], got {tuple(style_cond.shape)}")
+    bsz, dim = style_cond.shape
+    return style_cond.view(bsz, 1, 1, dim).expand(bsz, len(FACE_ORDER), 1, dim)
+
+
+def flatten_style_cond(style_cond_faces: torch.Tensor) -> torch.Tensor:
+    if style_cond_faces.ndim != 4:
+        raise ValueError(f"Expected style_cond_faces [B, 6, 1, D], got {tuple(style_cond_faces.shape)}")
+    bsz, num_faces, num_tokens, dim = style_cond_faces.shape
+    if num_faces != len(FACE_ORDER) or num_tokens != 1:
+        raise ValueError(f"Expected [B, 6, 1, D], got {tuple(style_cond_faces.shape)}")
+    return style_cond_faces.reshape(bsz * num_faces, num_tokens, dim)
+
+
+def make_style_scale_tensor(
+    batch_size: int,
     *,
-    pred_images: torch.Tensor,
-    front_low: torch.Tensor,
-    vae: nn.Module,
-    kernel_size: int,
-    sigma: float,
-    face_weights: Dict[str, float],
-    lambda_color: float = 1.0,
-    lambda_luma: float = 0.2,
-    lambda_feat: float = 0.5,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """
-    pred_images: (B, 5, 3, H, W) ordered as NON_FRONT_FACE_ORDER
-    front_low:  (B, 3, H, W)
-    """
-    total = pred_images.new_tensor(0.0)
-    metrics = {
-        "color": pred_images.new_tensor(0.0),
-        "luma": pred_images.new_tensor(0.0),
-        "feat": pred_images.new_tensor(0.0),
-    }
+    face_scales: Dict[str, float],
+    time_scale: torch.Tensor | float,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    face_values = torch.tensor([face_scales[name] for name in FACE_ORDER], device=device, dtype=dtype).view(1, -1)
+    if not torch.is_tensor(time_scale):
+        time_scale = torch.full((batch_size, 1), float(time_scale), device=device, dtype=dtype)
+    else:
+        time_scale = time_scale.to(device=device, dtype=dtype).view(batch_size, 1)
+    return (time_scale * face_values).reshape(batch_size * len(FACE_ORDER))
 
-    for face_idx, face_name in enumerate(NON_FRONT_FACE_ORDER):
-        weight = float(face_weights.get(face_name, 0.0))
-        if weight <= 0.0:
-            continue
 
-        pred_low = gaussian_blur_2d(pred_images[:, face_idx], kernel_size, sigma)
-        color = stats_loss(pred_low, front_low)
-        luma = luminance_loss(pred_low, front_low)
-        feat = feature_stats_loss(vae, pred_low, front_low)
-        face_loss = weight * (lambda_color * color + lambda_luma * luma + lambda_feat * feat)
+@dataclass
+class FrontGlobalStyleOutput:
+    e_img_global: torch.Tensor
+    e_txt_global: torch.Tensor
+    s0: torch.Tensor
+    style_cond: torch.Tensor
 
-        total = total + face_loss
-        metrics["color"] = metrics["color"] + weight * color
-        metrics["luma"] = metrics["luma"] + weight * luma
-        metrics["feat"] = metrics["feat"] + weight * feat
 
-    return total, metrics
+class FrontGlobalStyleConditioner(nn.Module):
+    def __init__(
+        self,
+        *,
+        clip_model_id: str = "openai/clip-vit-large-patch14",
+        style_dim: int = 768,
+        beta: float = 0.6,
+        cache_dir: str | None = None,
+        local_files_only: bool = False,
+    ):
+        super().__init__()
+        self.clip_model_id = clip_model_id
+        self.beta = float(beta)
+        self.style_dim = int(style_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.style_dim, self.style_dim),
+            nn.LayerNorm(self.style_dim),
+            nn.SiLU(),
+            nn.Linear(self.style_dim, self.style_dim),
+        )
+
+        clip_processor = CLIPProcessor.from_pretrained(
+            clip_model_id,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        clip_model = CLIPModel.from_pretrained(
+            clip_model_id,
+            cache_dir=cache_dir,
+            local_files_only=local_files_only,
+        )
+        clip_model.eval()
+        for param in clip_model.parameters():
+            param.requires_grad = False
+
+        self.__dict__["clip_processor"] = clip_processor
+        self.__dict__["clip_model"] = clip_model
+        self.__dict__["_clip_device"] = torch.device("cpu")
+        self.__dict__["_clip_dtype"] = torch.float32
+
+    @property
+    def clip_model(self) -> CLIPModel:
+        return self.__dict__["clip_model"]
+
+    @property
+    def clip_processor(self) -> CLIPProcessor:
+        return self.__dict__["clip_processor"]
+
+    def move_backbone(self, *, device: torch.device, dtype: torch.dtype) -> None:
+        target_dtype = dtype if device.type != "cpu" else torch.float32
+        self.__dict__["clip_model"] = self.clip_model.to(device=device, dtype=target_dtype)
+        self.clip_model.eval()
+        self.__dict__["_clip_device"] = device
+        self.__dict__["_clip_dtype"] = target_dtype
+
+    def _prepare_images(self, front_image: torch.Tensor) -> torch.Tensor:
+        image_processor = self.clip_processor.image_processor
+        crop_size = image_processor.crop_size
+        target_h = crop_size["height"] if isinstance(crop_size, dict) else int(crop_size)
+        target_w = crop_size["width"] if isinstance(crop_size, dict) else int(crop_size)
+        images = ((front_image.float() / 2) + 0.5).clamp(0, 1)
+        images = F.interpolate(images, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        mean = torch.tensor(image_processor.image_mean, device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
+        std = torch.tensor(image_processor.image_std, device=images.device, dtype=images.dtype).view(1, -1, 1, 1)
+        return (images - mean) / std
+
+    def _encode_image(self, front_image: torch.Tensor) -> torch.Tensor:
+        pixel_values = self._prepare_images(front_image).to(
+            device=self.__dict__["_clip_device"],
+            dtype=self.__dict__["_clip_dtype"],
+        )
+        with torch.no_grad():
+            image_features = self.clip_model.get_image_features(pixel_values=pixel_values)
+        return F.normalize(image_features.float(), dim=-1)
+
+    def _encode_text(self, prompts: List[str]) -> torch.Tensor:
+        text_inputs = self.clip_processor(
+            text=prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        )
+        text_inputs = {k: v.to(self.__dict__["_clip_device"]) for k, v in text_inputs.items()}
+        with torch.no_grad():
+            text_features = self.clip_model.get_text_features(**text_inputs)
+        return F.normalize(text_features.float(), dim=-1)
+
+    def forward(self, front_image: torch.Tensor, prompts: List[str]) -> FrontGlobalStyleOutput:
+        if front_image.ndim != 4:
+            raise ValueError(f"Expected front_image [B, 3, H, W], got {tuple(front_image.shape)}")
+        if len(prompts) != front_image.shape[0]:
+            raise ValueError(f"Expected {front_image.shape[0]} front prompts, got {len(prompts)}")
+
+        e_img_global = self._encode_image(front_image)
+        e_txt_global = self._encode_text(prompts)
+        s_raw = e_img_global - self.beta * e_txt_global
+        s0 = F.normalize(s_raw, dim=-1)
+        style_cond = self.mlp(s0.to(device=front_image.device, dtype=front_image.dtype))
+
+        return FrontGlobalStyleOutput(
+            e_img_global=e_img_global.to(device=front_image.device, dtype=front_image.dtype),
+            e_txt_global=e_txt_global.to(device=front_image.device, dtype=front_image.dtype),
+            s0=s0.to(device=front_image.device, dtype=front_image.dtype),
+            style_cond=style_cond,
+        )

@@ -356,8 +356,10 @@ class PreExtractedCubemapDataset(Dataset):
         self.scene_ids = sorted([f.replace('.json', '') for f in prompt_files])
         
         print(f"[INFO] PreExtractedCubemapDataset: Found {len(self.scene_ids)} scenes")
-        print(f"[INFO] Augmentation: {'Enabled (4x)' if augment else 'Disabled'}")
-        print(f"[INFO] Reference images returned: {'Enabled' if return_ref_images else 'Disabled'}")
+        if augment:
+            print("[INFO] Augmentation: Enabled (4x)")
+        if return_ref_images:
+            print("[INFO] Reference images returned: Enabled")
     
     def __len__(self):
         return len(self.scene_ids)
