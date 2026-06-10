@@ -111,7 +111,9 @@ class FrontGlobalStyleOutput:
     e_img_global: torch.Tensor
     e_txt_global: torch.Tensor
     s0: torch.Tensor
+    style_raw: torch.Tensor
     style_cond: torch.Tensor
+    style_gain: torch.Tensor
 
 
 class FrontGlobalStyleConditioner(nn.Module):
@@ -121,6 +123,8 @@ class FrontGlobalStyleConditioner(nn.Module):
         clip_model_id: str = "openai/clip-vit-large-patch14",
         style_dim: int = 768,
         beta: float = 0.6,
+        style_gain_init: float = 4.0,
+        style_gain_max: float = 8.0,
         cache_dir: str | None = None,
         local_files_only: bool = False,
     ):
@@ -128,12 +132,18 @@ class FrontGlobalStyleConditioner(nn.Module):
         self.clip_model_id = clip_model_id
         self.beta = float(beta)
         self.style_dim = int(style_dim)
+        self.style_gain_max = float(style_gain_max)
+        if self.style_gain_max <= 0:
+            raise ValueError(f"style_gain_max must be positive, got {self.style_gain_max}")
         self.mlp = nn.Sequential(
             nn.Linear(self.style_dim, self.style_dim),
             nn.LayerNorm(self.style_dim),
             nn.SiLU(),
             nn.Linear(self.style_dim, self.style_dim),
         )
+        init_ratio = min(max(float(style_gain_init) / self.style_gain_max, 1e-4), 1.0 - 1e-4)
+        init_logit = torch.logit(torch.tensor(init_ratio, dtype=torch.float32))
+        self.style_gain_logit = nn.Parameter(init_logit)
 
         clip_processor = CLIPProcessor.from_pretrained(
             clip_model_id,
@@ -201,6 +211,15 @@ class FrontGlobalStyleConditioner(nn.Module):
             text_features = self.clip_model.get_text_features(**text_inputs)
         return F.normalize(text_features.float(), dim=-1)
 
+    def get_style_gain(self, *, device: torch.device | None = None, dtype: torch.dtype | None = None) -> torch.Tensor:
+        style_gain = self.style_gain_max * torch.sigmoid(self.style_gain_logit)
+        if device is not None or dtype is not None:
+            style_gain = style_gain.to(
+                device=device if device is not None else style_gain.device,
+                dtype=dtype if dtype is not None else style_gain.dtype,
+            )
+        return style_gain
+
     def forward(self, front_image: torch.Tensor, prompts: List[str]) -> FrontGlobalStyleOutput:
         if front_image.ndim != 4:
             raise ValueError(f"Expected front_image [B, 3, H, W], got {tuple(front_image.shape)}")
@@ -211,11 +230,16 @@ class FrontGlobalStyleConditioner(nn.Module):
         e_txt_global = self._encode_text(prompts)
         s_raw = e_img_global - self.beta * e_txt_global
         s0 = F.normalize(s_raw, dim=-1)
-        style_cond = self.mlp(s0.to(device=front_image.device, dtype=front_image.dtype))
+        style_raw = self.mlp(s0.to(device=front_image.device, dtype=front_image.dtype))
+        style_unit = F.normalize(style_raw.float(), dim=-1).to(device=front_image.device, dtype=front_image.dtype)
+        style_gain = self.get_style_gain(device=front_image.device, dtype=front_image.dtype)
+        style_cond = style_gain * style_unit
 
         return FrontGlobalStyleOutput(
             e_img_global=e_img_global.to(device=front_image.device, dtype=front_image.dtype),
             e_txt_global=e_txt_global.to(device=front_image.device, dtype=front_image.dtype),
             s0=s0.to(device=front_image.device, dtype=front_image.dtype),
+            style_raw=style_raw,
             style_cond=style_cond,
+            style_gain=style_gain,
         )

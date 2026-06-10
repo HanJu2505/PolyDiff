@@ -350,8 +350,12 @@ class CubeDiffPipeline(StableDiffusionPipeline):
                 if "style_scale" not in iter_kwargs:
                     raise ValueError("style_cond requires style_scale in cross_attention_kwargs")
                 base_style_scale = iter_kwargs["style_scale"]
-                progress = i / max(1, len(self.scheduler.timesteps) - 1)
-                time_scale = 0.2 if progress < 0.25 else 0.5
+                override_time_scale = iter_kwargs.pop("style_time_scale_override", None)
+                if override_time_scale is None:
+                    progress = i / max(1, len(self.scheduler.timesteps) - 1)
+                    time_scale = 0.2 if progress < 0.25 else 0.5
+                else:
+                    time_scale = float(override_time_scale)
                 iter_kwargs["style_scale"] = base_style_scale.to(device=device, dtype=self.unet.dtype) * time_scale
 
             # Prepare added_cond_kwargs with RAW image_embeds (UNet requires this for encoder_hid_dim_type='ip_image_proj')
@@ -378,7 +382,7 @@ class CubeDiffPipeline(StableDiffusionPipeline):
             iter_uncond_kwargs = {
                 k: v
                 for k, v in cross_attention_kwargs.items()
-                if k not in ("style_cond", "style_scale")
+                if k not in ("style_cond", "style_scale", "style_time_scale_override")
             }
             iter_uncond_kwargs["front_face_drop"] = True  # CubeDiff specific
             iter_uncond_kwargs["uv_coords"] = uv_coords  # Pass UV coords for PE injection

@@ -1,15 +1,25 @@
 """
 Compare front-global-style inference variants for the appearance training pipeline.
 
-Outputs three runs from the same checkpoint and front conditioning image:
-1. with_style
-2. without_style
-3. higher_cfg_scale
+Outputs five runs from the same checkpoint and front conditioning image:
+1. with_style_dynamic
+2. with_style_t05
+3. with_style_t03
+4. without_style
+5. higher_cfg_scale
+python inference_appearance_compare.py \
+  --config training/configs/multitext_appearance.yaml \
+  --image /home/dell/Datasets/Sun360/MiniVal_CubeMap/030003_front.png \
+  --checkpoint-dir /home/dell/code/PolyDiff/checkpoints/polydiff-multitext-appearance/epoch_1_step_188_final \
+  --output-dir /home/dell/code/PolyDiff/output/appearance_compare_030003_front \
+  --prompts-json /home/dell/Datasets/Sun360/MiniVal_json/030003.json
+
 """
 
 import argparse
 import json
 import os
+import re
 from typing import Dict, List
 
 import torch
@@ -98,6 +108,8 @@ def load_full_cubediff_unet_weights(unet: torch.nn.Module, ckpt_path: str) -> No
         )
 
     missing, unexpected = unet.load_state_dict(state_dict, strict=False)
+    missing = [key for key in missing if ".processor." not in key]
+    unexpected = [key for key in unexpected if ".processor." not in key]
     if missing:
         print(f"[CubeDiff] Missing keys when loading UNet: {len(missing)}")
     if unexpected:
@@ -114,6 +126,44 @@ def load_prompts(prompts_json: str) -> Dict[str, str]:
     with open(prompts_json, "r") as f:
         prompt_data = json.load(f)
     return {face: prompt_data.get(face, "") for face in FACE_ORDER}
+
+
+def build_prompt_filter_patterns(words: List[str]) -> List[re.Pattern[str]]:
+    patterns = []
+    for word in words:
+        phrase = str(word).strip()
+        if not phrase:
+            continue
+        patterns.append(re.compile(re.escape(phrase), flags=re.IGNORECASE))
+    return patterns
+
+
+def sanitize_content_prompt(prompt: str, patterns: List[re.Pattern[str]]) -> str:
+    cleaned = prompt
+    for pattern in patterns:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?]){2,}", r"\1", cleaned)
+    return cleaned.strip(" ,.;:!?") or prompt
+
+
+def resolve_front_content_prompt(cfg, prompts_json: str, prompts_dict: Dict[str, str]) -> str:
+    if prompts_json and os.path.exists(prompts_json):
+        with open(prompts_json, "r") as f:
+            prompt_data = json.load(f)
+        content_prompt = str(prompt_data.get("front_content_prompt", "")).strip()
+        if content_prompt:
+            return content_prompt
+
+    content_filter_cfg = getattr(cfg.appearance, "content_prompt_filter", {})
+    enabled = bool(getattr(content_filter_cfg, "enabled", False))
+    front_prompt = prompts_dict.get("front", "")
+    if not enabled:
+        return front_prompt
+
+    patterns = build_prompt_filter_patterns(list(getattr(content_filter_cfg, "words", [])))
+    return sanitize_content_prompt(front_prompt, patterns)
 
 
 def load_style_conditioner(cfg, checkpoint_dir: str, device: torch.device, dtype: torch.dtype) -> FrontGlobalStyleConditioner:
@@ -145,9 +195,9 @@ def load_pipeline(cfg, checkpoint_dir: str, device: torch.device, dtype: torch.d
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
 
-    load_full_cubediff_unet_weights(pipe.unet, os.path.join(checkpoint_dir, "model.safetensors"))
     install_trainable_attn1_processors(pipe.unet)
     install_global_style_processors(pipe.unet, module_prefix=str(cfg.appearance.style_block))
+    load_full_cubediff_unet_weights(pipe.unet, os.path.join(checkpoint_dir, "model.safetensors"))
 
     if cfg.training.prediction_type == "v_prediction":
         pipe.scheduler = DDIMScheduler.from_pretrained(
@@ -198,6 +248,7 @@ def run_variant(
     conditioning_image: torch.Tensor,
     style_cond: torch.Tensor | None,
     style_scale: torch.Tensor | None,
+    style_time_scale_override: float | None,
     cfg_scale: float,
     num_inference_steps: int,
     generator: torch.Generator,
@@ -206,6 +257,8 @@ def run_variant(
     if style_cond is not None:
         cross_attention_kwargs["style_cond"] = style_cond
         cross_attention_kwargs["style_scale"] = style_scale
+        if style_time_scale_override is not None:
+            cross_attention_kwargs["style_time_scale_override"] = style_time_scale_override
 
     with torch.no_grad():
         return pipe(
@@ -228,10 +281,15 @@ def main():
 
     prompts_dict = load_prompts(args.prompts_json)
     prompts = build_prompt_list(prompts_dict)
+    front_content_prompt = resolve_front_content_prompt(cfg, args.prompts_json, prompts_dict)
     face_scales = {
         name: float(getattr(cfg.appearance.face_scales, name, DEFAULT_FACE_SCALES[name]))
         for name in FACE_ORDER
     }
+    compare_time_scales = list(getattr(cfg.appearance, "compare_time_scales", [0.5, 0.3]))
+    if len(compare_time_scales) < 2:
+        raise ValueError("appearance.compare_time_scales must contain at least two values")
+    validation_time_scale = float(getattr(cfg.appearance, "validation_time_scale", compare_time_scales[0]))
 
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Loading checkpoint from {args.checkpoint_dir}")
@@ -242,7 +300,7 @@ def main():
     original_pil.save(os.path.join(args.output_dir, "conditioning_front.png"))
 
     with torch.no_grad():
-        style_out = conditioner(conditioning_image.unsqueeze(0), [prompts[0]])
+        style_out = conditioner(conditioning_image.unsqueeze(0), [front_content_prompt])
         style_cond = flatten_style_cond(expand_style_cond(style_out.style_cond))
         style_scale = make_style_scale_tensor(
             1,
@@ -253,12 +311,14 @@ def main():
         )
 
     runs = [
-        ("with_style", style_cond, style_scale, args.cfg_scale),
-        ("without_style", None, None, args.cfg_scale),
-        ("higher_cfg_scale", style_cond, style_scale, args.higher_cfg_scale),
+        ("with_style_dynamic", style_cond, style_scale, None, args.cfg_scale),
+        ("with_style_t05", style_cond, style_scale, validation_time_scale, args.cfg_scale),
+        ("with_style_t03", style_cond, style_scale, float(compare_time_scales[1]), args.cfg_scale),
+        ("without_style", None, None, None, args.cfg_scale),
+        ("higher_cfg_scale", style_cond, style_scale, None, args.higher_cfg_scale),
     ]
 
-    for index, (name, run_style_cond, run_style_scale, cfg_scale) in enumerate(runs):
+    for index, (name, run_style_cond, run_style_scale, run_time_scale, cfg_scale) in enumerate(runs):
         print(f"[INFO] Running {name} with cfg_scale={cfg_scale}")
         generator = torch.Generator(device=device).manual_seed(args.seed + index)
         output = run_variant(
@@ -267,6 +327,7 @@ def main():
             conditioning_image=conditioning_image,
             style_cond=run_style_cond,
             style_scale=run_style_scale,
+            style_time_scale_override=run_time_scale,
             cfg_scale=cfg_scale,
             num_inference_steps=args.num_inference_steps,
             generator=generator,
@@ -282,6 +343,9 @@ def main():
                 "higher_cfg_scale": args.higher_cfg_scale,
                 "num_inference_steps": args.num_inference_steps,
                 "seed": args.seed,
+                "front_content_prompt": front_content_prompt,
+                "validation_time_scale": validation_time_scale,
+                "compare_time_scales": compare_time_scales,
                 "prompts": prompts_dict,
             },
             f,

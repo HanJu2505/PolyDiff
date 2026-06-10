@@ -7,9 +7,9 @@ name: "polydiff-multitext-appearance"
 
 training:
   seed: 42
-  epochs: 1
-  batch_size: 16
-  per_gpu_batch_size: 1
+  epochs: 4
+  batch_size: 32
+  per_gpu_batch_size: 2
   learning_rate: 1e-4
   betas: [0.9, 0.999]
   eps: 1e-8
@@ -20,13 +20,14 @@ training:
   mixed_precision: "fp16"
   checkpoint_interval_type: "steps"
   checkpoint_interval: 100
-  validation_interval: 2
+  validation_interval: 10
   prediction_type: "epsilon"
   type: "multitext"
   resume_checkpoint: false
   resume_checkpoint_filename: ""
   max_train_steps: 0
   use_preextracted: true
+  validation_sample_index: 1
   augment: true
   cubediff_weights: "/home/dell/code/PolyDiff/models/cubediff-512-multitxt/unet/diffusion_pytorch_model.safetensors"
 
@@ -51,19 +52,46 @@ appearance:
   local_files_only: false
   beta: 0.6
   style_dim: 768
+  style_gain_init: 4.0
+  style_gain_max: 8.0
   style_block: "up_blocks.1"
+  validation_time_scale: 0.5
+  compare_time_scales: [0.5, 0.3]
   face_scales:
     front: 0.90
-    left: 0.45
-    right: 0.45
-    back: 0.15
-    top: 0.10
-    bottom: 0.10
+    left: 0.40
+    right: 0.40
+    back: 0.10
+    top: 0.05
+    bottom: 0.05
   time_schedule:
     split: 0.25
     early: 0.2
     late: 0.5
+  cond_dropout:
+    full_cond: 0.75
+    text_only: 0.15
+    null_cond: 0.10
+  content_prompt_filter:
+    enabled: true
+    words:
+      - "sunny"
+      - "cloudy"
+      - "golden hour"
+      - "dramatic lighting"
+      - "moody"
+      - "cinematic"
+      - "realistic"
+      - "photorealistic"
+      - "vivid"
+      - "warm light"
   loss:
     weight: 0.05
-    lambda_color: 1.0
+    lambda_color: 0.8
     lambda_luma: 0.3
+    face_weights:
+      left: 0.35
+      right: 0.35
+      back: 0.08
+      top: 0.05
+      bottom: 0.05

@@ -6,8 +6,10 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import os
+import re
 import time
 from contextlib import nullcontext
 from typing import Dict
@@ -96,6 +98,8 @@ def load_full_cubediff_unet_weights(unet: nn.Module, ckpt_path: str) -> None:
         )
 
     missing, unexpected = unet.load_state_dict(state_dict, strict=False)
+    missing = [key for key in missing if ".processor." not in key]
+    unexpected = [key for key in unexpected if ".processor." not in key]
     if missing:
         print(f"[CubeDiff] Missing keys when loading UNet: {len(missing)}")
     if unexpected:
@@ -144,21 +148,77 @@ def get_front_prompts(prompts: list[str], batch_size: int, num_faces: int) -> li
     return [prompts[i * num_faces] for i in range(batch_size)]
 
 
+def build_prompt_filter_patterns(words: list[str]) -> list[re.Pattern[str]]:
+    patterns = []
+    for word in words:
+        phrase = str(word).strip()
+        if not phrase:
+            continue
+        patterns.append(re.compile(re.escape(phrase), flags=re.IGNORECASE))
+    return patterns
+
+
+def sanitize_content_prompt(prompt: str, patterns: list[re.Pattern[str]]) -> str:
+    cleaned = prompt
+    for pattern in patterns:
+        cleaned = pattern.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?]){2,}", r"\1", cleaned)
+    return cleaned.strip(" ,.;:!?") or prompt
+
+
+def get_front_content_prompts(
+    *,
+    scene_ids: list[str],
+    front_prompts: list[str],
+    prompt_dir: str,
+    cache: dict[str, str],
+    filter_enabled: bool,
+    filter_patterns: list[re.Pattern[str]],
+) -> list[str]:
+    resolved: list[str] = []
+    for scene_id, front_prompt in zip(scene_ids, front_prompts):
+        cached = cache.get(scene_id)
+        if cached is not None:
+            resolved.append(cached)
+            continue
+
+        content_prompt = ""
+        prompt_path = os.path.join(prompt_dir, f"{scene_id}.json")
+        if os.path.exists(prompt_path):
+            try:
+                with open(prompt_path, "r") as f:
+                    prompt_data = json.load(f)
+                content_prompt = str(prompt_data.get("front_content_prompt", "")).strip()
+            except Exception:
+                content_prompt = ""
+
+        if not content_prompt:
+            content_prompt = front_prompt
+            if filter_enabled:
+                content_prompt = sanitize_content_prompt(content_prompt, filter_patterns)
+
+        cache[scene_id] = content_prompt
+        resolved.append(content_prompt)
+    return resolved
+
+
 def build_sd_prompts(
     *,
     prompts: list[str],
     single_captions: list[str],
-    drop_mask: torch.Tensor,
+    null_mask: torch.Tensor,
     training_type: str,
     num_faces: int,
 ) -> list[str]:
-    full_mask = drop_mask.repeat_interleave(num_faces).tolist()
+    full_mask = null_mask.repeat_interleave(num_faces).tolist()
     if training_type == "image_only":
         return [""] * len(prompts)
     if training_type == "single_caption":
         output = []
         for index, caption in enumerate(single_captions):
-            value = "" if bool(drop_mask[index]) else caption
+            value = "" if bool(null_mask[index]) else caption
             output.extend([value] * num_faces)
         return output
     return [prompt if not dropped else "" for prompt, dropped in zip(prompts, full_mask)]
@@ -228,9 +288,9 @@ def main(cfg: DictConfig):
     if hasattr(pipe.vae, "enable_tiling"):
         pipe.vae.enable_tiling()
 
-    load_full_cubediff_unet_weights(pipe.unet, os.path.expanduser(cfg.training.cubediff_weights))
     install_trainable_attn1_processors(pipe.unet)
     install_global_style_processors(pipe.unet, module_prefix=str(cfg.appearance.style_block))
+    load_full_cubediff_unet_weights(pipe.unet, os.path.expanduser(cfg.training.cubediff_weights))
 
     if cfg.training.prediction_type == "v_prediction":
         pipe.scheduler = DDIMScheduler.from_pretrained(
@@ -260,6 +320,8 @@ def main(cfg: DictConfig):
         clip_model_id=str(cfg.appearance.clip_model_id),
         style_dim=int(cfg.appearance.style_dim),
         beta=float(cfg.appearance.beta),
+        style_gain_init=float(getattr(cfg.appearance, "style_gain_init", 4.0)),
+        style_gain_max=float(getattr(cfg.appearance, "style_gain_max", 8.0)),
         cache_dir=cache_dir,
         local_files_only=bool(getattr(cfg.appearance, "local_files_only", False)),
     )
@@ -292,9 +354,16 @@ def main(cfg: DictConfig):
         collate_fn = cubemap_collate_fn
         val_dataset = dataset
 
-    val_sample_fixed = val_dataset[0]
+    val_sample_index = int(getattr(cfg.training, "validation_sample_index", 0))
+    if val_sample_index < 0 or val_sample_index >= len(val_dataset):
+        raise ValueError(
+            f"validation_sample_index={val_sample_index} is out of range for validation dataset of size {len(val_dataset)}"
+        )
+    val_sample_fixed = val_dataset[val_sample_index]
     val_conditioning_image_fixed = val_sample_fixed[0][0]
     val_prompts_fixed = val_sample_fixed[1]
+    val_scene_id_fixed = val_sample_fixed[3] if len(val_sample_fixed) > 3 else ""
+    print(f"[INFO] Fixed validation sample: index={val_sample_index}, scene_id={val_scene_id_fixed}")
 
     dataloader = DataLoader(
         dataset,
@@ -370,7 +439,22 @@ def main(cfg: DictConfig):
         name: float(getattr(cfg.appearance.face_scales, name, DEFAULT_FACE_SCALES[name]))
         for name in FACE_ORDER
     }
-    style_loss_weights = {name: face_scales[name] for name in NON_FRONT_FACE_ORDER}
+    face_weight_cfg = getattr(getattr(cfg.appearance, "loss", {}), "face_weights", {})
+    style_loss_weights = {
+        name: float(getattr(face_weight_cfg, name, face_scales[name])) for name in NON_FRONT_FACE_ORDER
+    }
+    cond_dropout = getattr(cfg.appearance, "cond_dropout", {})
+    cond_full_prob = float(getattr(cond_dropout, "full_cond", 0.75))
+    cond_text_only_prob = float(getattr(cond_dropout, "text_only", 0.15))
+    cond_null_prob = float(getattr(cond_dropout, "null_cond", 0.10))
+    if abs((cond_full_prob + cond_text_only_prob + cond_null_prob) - 1.0) > 1e-6:
+        raise ValueError("appearance.cond_dropout probabilities must sum to 1.0")
+
+    content_filter_cfg = getattr(cfg.appearance, "content_prompt_filter", {})
+    content_filter_enabled = bool(getattr(content_filter_cfg, "enabled", False))
+    content_filter_words = list(getattr(content_filter_cfg, "words", []))
+    content_filter_patterns = build_prompt_filter_patterns(content_filter_words)
+    content_prompt_cache: Dict[str, str] = {}
 
     if accelerator.is_main_process:
         trainable_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
@@ -387,6 +471,12 @@ def main(cfg: DictConfig):
         total_style_loss = 0.0
         total_color_loss = 0.0
         total_luma_loss = 0.0
+        total_style_raw_norm = 0.0
+        total_style_cond_norm = 0.0
+        total_style_gain = 0.0
+        total_full_ratio = 0.0
+        total_text_only_ratio = 0.0
+        total_null_ratio = 0.0
 
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", disable=not accelerator.is_main_process)
         for _, batch in enumerate(progress_bar):
@@ -414,12 +504,24 @@ def main(cfg: DictConfig):
                         cubemap_faces = cubemap_batch.view(batch_size, num_faces, 3, cubemap_batch.shape[-2], cubemap_batch.shape[-1])
                         front_images = cubemap_faces[:, 0]
                         front_prompts = get_front_prompts(prompts, batch_size, num_faces)
+                        scene_id_list = [str(scene_id) for scene_id in scene_ids]
+                        front_content_prompts = get_front_content_prompts(
+                            scene_ids=scene_id_list,
+                            front_prompts=front_prompts,
+                            prompt_dir=cfg.directories.prompt_dir,
+                            cache=content_prompt_cache,
+                            filter_enabled=content_filter_enabled,
+                            filter_patterns=content_filter_patterns,
+                        )
 
-                        drop_mask = torch.rand(batch_size, device=accelerator.device) < 0.1
+                        cond_rand = torch.rand(batch_size, device=accelerator.device)
+                        null_mask = cond_rand < cond_null_prob
+                        text_only_mask = (cond_rand >= cond_null_prob) & (cond_rand < cond_null_prob + cond_text_only_prob)
+                        full_mask = ~(null_mask | text_only_mask)
                         sd_prompts = build_sd_prompts(
                             prompts=prompts,
                             single_captions=single_captions,
-                            drop_mask=drop_mask,
+                            null_mask=null_mask,
                             training_type=str(cfg.training.type),
                             num_faces=num_faces,
                         )
@@ -450,10 +552,10 @@ def main(cfg: DictConfig):
                         orig_latents = latents.clone()
                         front_low = gaussian_blur_2d(front_images, lowpass_kernel, lowpass_sigma)
 
-                    style_out = appearance_conditioner(front_images, front_prompts)
+                    style_out = appearance_conditioner(front_images, front_content_prompts)
                     style_faces = expand_style_cond(style_out.style_cond)
                     style_cond = flatten_style_cond(style_faces)
-                    keep_mask = (~drop_mask).repeat_interleave(num_faces).view(batch_size * num_faces, 1, 1).to(style_cond.dtype)
+                    keep_mask = full_mask.repeat_interleave(num_faces).view(batch_size * num_faces, 1, 1).to(style_cond.dtype)
                     style_cond = style_cond * keep_mask
 
                     time_scale = resolve_time_scale(
@@ -470,7 +572,7 @@ def main(cfg: DictConfig):
                         device=latents.device,
                         dtype=latents.dtype,
                     )
-                    style_scale = style_scale * (~drop_mask).repeat_interleave(num_faces).to(style_scale.dtype)
+                    style_scale = style_scale * full_mask.repeat_interleave(num_faces).to(style_scale.dtype)
 
                     latents[non_front_mask] = pipe.scheduler.add_noise(
                         latents[non_front_mask], noise, timesteps[non_front_mask]
@@ -542,6 +644,12 @@ def main(cfg: DictConfig):
                     total_style_loss += style_loss.detach().float()
                     total_color_loss += style_metrics["color"].detach().float()
                     total_luma_loss += style_metrics["luma"].detach().float()
+                    total_style_raw_norm += style_out.style_raw.detach().norm(dim=-1).mean().float()
+                    total_style_cond_norm += style_out.style_cond.detach().norm(dim=-1).mean().float()
+                    total_style_gain += style_out.style_gain.detach().float()
+                    total_full_ratio += full_mask.float().mean().detach()
+                    total_text_only_ratio += text_only_mask.float().mean().detach()
+                    total_null_ratio += null_mask.float().mean().detach()
 
                 accelerator.backward(loss)
 
@@ -570,15 +678,26 @@ def main(cfg: DictConfig):
                     avg_style = gather_metric(total_style_loss)
                     avg_color = gather_metric(total_color_loss)
                     avg_luma = gather_metric(total_luma_loss)
+                    avg_style_raw_norm = gather_metric(total_style_raw_norm)
+                    avg_style_cond_norm = gather_metric(total_style_cond_norm)
+                    avg_style_gain = gather_metric(total_style_gain)
+                    avg_full_ratio = gather_metric(total_full_ratio)
+                    avg_text_only_ratio = gather_metric(total_text_only_ratio)
+                    avg_null_ratio = gather_metric(total_null_ratio)
 
                     total_loss = 0.0
                     total_denoise_loss = 0.0
                     total_style_loss = 0.0
                     total_color_loss = 0.0
                     total_luma_loss = 0.0
+                    total_style_raw_norm = 0.0
+                    total_style_cond_norm = 0.0
+                    total_style_gain = 0.0
+                    total_full_ratio = 0.0
+                    total_text_only_ratio = 0.0
+                    total_null_ratio = 0.0
 
                     if accelerator.is_main_process:
-                        style_norm = style_out.style_cond.detach().norm(dim=-1).mean().item()
                         if swanlab_enabled:
                             import swanlab
 
@@ -589,7 +708,12 @@ def main(cfg: DictConfig):
                                     "loss_style": avg_style.item(),
                                     "loss_style/color": avg_color.item(),
                                     "loss_style/luma": avg_luma.item(),
-                                    "style_cond_norm": style_norm,
+                                    "style_cond_raw_norm": avg_style_raw_norm.item(),
+                                    "style_cond_norm": avg_style_cond_norm.item(),
+                                    "style_gain": avg_style_gain.item(),
+                                    "cond_mode/full": avg_full_ratio.item(),
+                                    "cond_mode/text_only": avg_text_only_ratio.item(),
+                                    "cond_mode/null": avg_null_ratio.item(),
                                     "time_per_step": time_elapsed,
                                     "learning_rate": lr_scheduler.get_last_lr()[0],
                                     "grad_norm": grad_norm.item(),
@@ -616,6 +740,14 @@ def main(cfg: DictConfig):
 
                             val_conditioning_image = val_conditioning_image_fixed.to(accelerator.device, dtype=weight_dtype)
                             val_prompts = val_prompts_fixed
+                            val_front_content_prompt = get_front_content_prompts(
+                                scene_ids=[str(val_scene_id_fixed)],
+                                front_prompts=[val_prompts[0]],
+                                prompt_dir=cfg.directories.prompt_dir,
+                                cache=content_prompt_cache,
+                                filter_enabled=content_filter_enabled,
+                                filter_patterns=content_filter_patterns,
+                            )[0]
                             if cfg.training.type == "image_only":
                                 val_prompts_for_gen = ""
                             elif cfg.training.type == "single_caption":
@@ -631,7 +763,7 @@ def main(cfg: DictConfig):
                                 )
                                 with torch.no_grad(), amp_context:
                                     val_front = val_conditioning_image.unsqueeze(0)
-                                    val_style = conditioner_eval(val_front, [val_prompts[0]])
+                                    val_style = conditioner_eval(val_front, [val_front_content_prompt])
                                     val_style_cond = flatten_style_cond(expand_style_cond(val_style.style_cond))
                                     val_style_scale = make_style_scale_tensor(
                                         1,
